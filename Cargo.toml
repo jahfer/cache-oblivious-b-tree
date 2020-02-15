@@ -1,7 +1,12 @@
 [package]
-name = "cache-oblivious-b-tree"
+name = "cache_oblivious_b_tree"
 version = "0.1.0"
 authors = ["Jahfer Husain <echo@jahfer.com>"]
 edition = "2018"
 
-[dependencies]
+[dev-dependencies]
+criterion = "0.3"
+
+[[bench]]
+name = "my_benchmark"
+harness = false
