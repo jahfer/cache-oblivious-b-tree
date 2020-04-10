@@ -11,7 +11,7 @@ use std::ptr;
 #[derive(Debug)]
 enum BinaryTreeEntry<K> {
     Node(BinaryTree<K>),
-    Leaf { key: K, index: usize }, // TODO: use Leaf { key, index } syntax
+    Leaf { key: K, index: usize },
 }
 
 #[derive(Debug)]
@@ -19,6 +19,22 @@ struct BinaryTree<K> {
     key: K,
     left: Rc<RefCell<Option<BinaryTreeEntry<K>>>>,
     right: Rc<RefCell<Option<BinaryTreeEntry<K>>>>
+}
+
+fn convert_leaf_to_node<K: Copy>(leaf: &BinaryTreeEntry<K>) -> BinaryTreeEntry<K> {
+    match leaf {
+        BinaryTreeEntry::Leaf { key, index } => {
+            let new_cell = Rc::new(RefCell::new(None));
+            BinaryTreeEntry::Node(
+                BinaryTree {
+                    key: *key,
+                    left: Rc::clone(&new_cell),
+                    right: Rc::new(RefCell::new(Some(BinaryTreeEntry::Leaf { key: *key, index: *index })))
+                }
+            )
+        },
+        BinaryTreeEntry::Node(_) => unreachable!(),
+    }
 }
 
 impl <K: Copy + Ord + Debug> BinaryTree<K> {
@@ -38,7 +54,7 @@ impl <K: Copy + Ord + Debug> BinaryTree<K> {
         }
     }
 
-    fn insertion_cell(&self, insertion_key: K) -> Rc<RefCell<Option<BinaryTreeEntry<K>>>> {
+    fn fetch_insertion_cell(&self, insertion_key: K) -> Rc<RefCell<Option<BinaryTreeEntry<K>>>> {
         if insertion_key < self.key {
             let mut left_entry = self.left.borrow_mut();
 
@@ -46,19 +62,16 @@ impl <K: Copy + Ord + Debug> BinaryTree<K> {
                 None => Rc::clone(&self.left),
                 Some(entry) => {
                     match entry {
-                        BinaryTreeEntry::Leaf { key, index } => {
-                            let new_cell = Rc::new(RefCell::new(None));
-                            let node = BinaryTreeEntry::Node(
-                                BinaryTree {
-                                    key: *key,
-                                    left: Rc::clone(&new_cell),
-                                    right: Rc::new(RefCell::new(Some(BinaryTreeEntry::Leaf { key: *key, index: *index })))
-                                }
-                            );
+                        BinaryTreeEntry::Leaf { key: _, index: _ } => {
+                            let node = convert_leaf_to_node(entry);
+                            let cell = match &node {
+                                BinaryTreeEntry::Node(tree) => Rc::clone(&tree.left),
+                                BinaryTreeEntry::Leaf { key: _, index: _ } => unreachable!()
+                            };
                             left_entry.replace(node);
-                            new_cell
+                            cell
                         },
-                        BinaryTreeEntry::Node(tree) => tree.insertion_cell(insertion_key)
+                        BinaryTreeEntry::Node(tree) => tree.fetch_insertion_cell(insertion_key)
                     }
                 }
             }
@@ -72,19 +85,16 @@ impl <K: Copy + Ord + Debug> BinaryTree<K> {
                             // TODO use index to mark for cleanup
                             Rc::clone(&self.right)
                         },
-                        BinaryTreeEntry::Leaf { key, index } => {
-                            let new_cell = Rc::new(RefCell::new(None));
-                            let node = BinaryTreeEntry::Node(
-                                BinaryTree {
-                                    key: *key,
-                                    left: Rc::clone(&new_cell),
-                                    right: Rc::new(RefCell::new(Some(BinaryTreeEntry::Leaf { key: *key, index: *index })))
-                                }
-                            );
+                        BinaryTreeEntry::Leaf { key: _, index: _ } => {
+                            let node = convert_leaf_to_node(entry);
+                            let cell = match &node {
+                                BinaryTreeEntry::Node(tree) => Rc::clone(&tree.left),
+                                BinaryTreeEntry::Leaf { key: _, index: _ } => unreachable!()
+                            };
                             right_entry.replace(node);
-                            new_cell
+                            cell
                         },
-                        BinaryTreeEntry::Node(tree) => tree.insertion_cell(insertion_key)
+                        BinaryTreeEntry::Node(tree) => tree.fetch_insertion_cell(insertion_key)
                     }
                 }
             }
@@ -137,7 +147,7 @@ impl <K: Copy + Debug + Ord, V: Copy + Debug> CacheObliviousBTreeMap<K, V> {
                 self.tree = Some(BinaryTree { key, left: Rc::new(RefCell::new(None)), right: Rc::clone(&node) });
             },
             Some(tree) => {
-                let cell = tree.insertion_cell(key);
+                let cell = tree.fetch_insertion_cell(key);
                 cell.replace(Some(new_leaf));
             }
         }
