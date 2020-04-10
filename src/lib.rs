@@ -1,12 +1,16 @@
 #![feature(new_uninit)]
+#![feature(alloc_layout_extra)]
+
+extern crate alloc;
 
 use std::fmt::Debug;
 use std::marker::Copy;
-use std::mem::MaybeUninit;
 use std::cmp::Ord;
 use std::rc::Rc;
 use std::cell::RefCell;
-use std::ptr;
+
+mod packed_data;
+use packed_data::{PackedData};
 
 #[derive(Debug)]
 enum BinaryTreeEntry<K> {
@@ -104,7 +108,7 @@ impl <K: Copy + Ord + Debug> BinaryTree<K> {
 
 #[derive(Debug)]
 pub struct CacheObliviousBTreeMap<K, V> {
-    packed_dataset: [MaybeUninit<V>; 32],
+    packed_dataset: PackedData<V>,
     tree: Option<BinaryTree<K>>,
     // temporary
     next_loc: usize,
@@ -113,32 +117,24 @@ pub struct CacheObliviousBTreeMap<K, V> {
 impl <K, V> CacheObliviousBTreeMap<K, V> {
     pub fn new() -> Self {
         CacheObliviousBTreeMap {
-            packed_dataset: unsafe { MaybeUninit::uninit().assume_init() },
+            packed_dataset: PackedData::new(32),
             tree: None,
             next_loc: 0,
         }
     }
 }
 
-impl <K, V> Drop for CacheObliviousBTreeMap<K, V> {
-    fn drop(&mut self) {
-        for elem in &mut self.packed_dataset {
-            unsafe { ptr::drop_in_place(elem.as_mut_ptr()) }
-        }
-    }
-}
-
 impl <K: Copy + Debug + Ord, V: Copy + Debug> CacheObliviousBTreeMap<K, V> {
-    pub fn get(&self, key: K) -> Option<V> {
+    pub fn get(&self, key: K) -> Option<&V> {
         self.tree
             .as_ref()
             .and_then(|t| t.search(key))
-            .map(|idx| unsafe { *(self.packed_dataset[idx].as_ptr()) })
+            .map(|idx| self.packed_dataset.get(idx))
     }
 
     pub fn insert(&mut self, key: K, value: V) {
         let index = self.next_cache_location();
-        self.packed_dataset[index] = MaybeUninit::new(value);
+        self.packed_dataset.set(index, value);
         let new_leaf = BinaryTreeEntry::Leaf { key, index };
 
         match self.tree.as_ref() {
@@ -153,8 +149,7 @@ impl <K: Copy + Debug + Ord, V: Copy + Debug> CacheObliviousBTreeMap<K, V> {
         }
     }
 
-    // TODO this should look at the location from the current tree to
-    // find the correct insertion location
+    // TODO PackedData should manage this
     #[inline]
     fn next_cache_location(&mut self) -> usize {
         let loc = self.next_loc;
@@ -174,9 +169,9 @@ mod tests {
         map.insert(3, "World");
         map.insert(2, "!");
 
-        assert_eq!(map.get(5), Some("Hello"));
+        assert_eq!(map.get(5), Some(&"Hello"));
         assert_eq!(map.get(4), None);
-        assert_eq!(map.get(3), Some("World"));
-        assert_eq!(map.get(2), Some("!"));
+        assert_eq!(map.get(3), Some(&"World"));
+        assert_eq!(map.get(2), Some(&"!"));
     }
 }
