@@ -1,9 +1,4 @@
 #![feature(alloc_layout_extra)]
-// #![feature(new_uninit)]
-// #![feature(get_mut_unchecked)]
-// #![feature(maybe_uninit_ref)]
-// #![feature(slice_from_raw_parts)]
-// #![feature(maybe_uninit_slice_assume_init)]
 
 #[macro_use]
 extern crate memoffset;
@@ -33,8 +28,8 @@ struct CellInner<K, V> {
   version: u16,
   marker: Marker<K, V>,
   empty: bool,
-  key: UnsafeCell<K>,
-  value: UnsafeCell<V>,
+  key: K,
+  value: V,
 }
 
 pub struct Cell<K, V> {
