@@ -1,9 +1,9 @@
-#![feature(new_uninit)]
 #![feature(alloc_layout_extra)]
-#![feature(get_mut_unchecked)]
-#![feature(maybe_uninit_ref)]
-#![feature(slice_from_raw_parts)]
-#![feature(maybe_uninit_slice_assume_init)]
+// #![feature(new_uninit)]
+// #![feature(get_mut_unchecked)]
+// #![feature(maybe_uninit_ref)]
+// #![feature(slice_from_raw_parts)]
+// #![feature(maybe_uninit_slice_assume_init)]
 
 #[macro_use]
 extern crate memoffset;
