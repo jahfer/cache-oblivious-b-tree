@@ -11,7 +11,7 @@ use std::fmt::{self, Debug};
 use std::marker::Copy;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, Ordering as AtomicOrdering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 const COUNTER_INIT_VALUE: u16 = 1;
 
@@ -50,17 +50,25 @@ impl<K: Debug, V: Debug> Debug for Cell<K, V> {
     let key = unsafe { &*self.key.load(AtomicOrdering::Acquire) };
     let value = unsafe { &*self.value.load(AtomicOrdering::Acquire) };
 
-    f.debug_struct("Cell")
+    let mut dbg_struct = f.debug_struct("Cell");
+
+    dbg_struct
       .field("version", &version)
       .field("marker", marker)
-      .field("empty", &empty)
-      .field("key", key)
-      .field("value", value)
-      .finish()
+      .field("empty", &empty);
+
+    if empty {
+      let none: Option<K> = Option::None;
+      dbg_struct.field("key", &none).field("value", &none);
+    } else {
+      dbg_struct.field("key", key).field("value", value);
+    }
+
+    dbg_struct.finish()
   }
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Clone, Copy)]
 enum Element<T: Eq> {
   Infimum,
   Value(T),
@@ -78,10 +86,10 @@ impl<T: Eq + Ord> Ord for Element<T> {
   }
 }
 
-// Return as Arc<Block<K, V>>
+#[derive(Debug)]
 pub struct Block<K: Eq, V> {
-  min_key: Element<K>, // TODO: update
-  max_key: Element<K>,
+  min_key: RwLock<Element<K>>, // TODO: use AtomicPtr for updates?
+  max_key: RwLock<Element<K>>,
   cells: Box<[Cell<K, V>]>,
 }
 
@@ -90,7 +98,10 @@ impl<K: Eq + PartialOrd + Copy + Debug, V: Copy + Debug> Block<K, V> {
     // default to using first slot
     let mut insertion_cell: &Cell<K, V> = &self.cells[0];
 
-    if self.min_key < Element::Value(key) {
+    let block_min_key = *self.min_key.read().unwrap();
+    let replace_min_key = block_min_key == Element::Infimum || block_min_key > Element::Value(key);
+
+    if !replace_min_key {
       for cell in self.cells.iter() {
         let is_empty = unsafe { cell.empty.as_ref() };
         if is_empty.load(AtomicOrdering::Acquire) {
@@ -164,6 +175,10 @@ impl<K: Eq + PartialOrd + Copy + Debug, V: Copy + Debug> Block<K, V> {
       }
     }
 
+    if replace_min_key {
+      *self.min_key.try_write().unwrap() = Element::Value(key);
+    }
+
     insertion_cell
   }
 }
@@ -220,8 +235,8 @@ impl<K: Eq + Debug + PartialOrd + Copy, V: Debug + Copy> PackedData<K, V> {
       }
 
       let block = Block {
-        min_key: Element::Infimum,
-        max_key: Element::Supremum,
+        min_key: RwLock::new(Element::Infimum),
+        max_key: RwLock::new(Element::Supremum),
         // prev_block:,
         // next_block:,
         cells: vec.into_boxed_slice(),
@@ -233,8 +248,7 @@ impl<K: Eq + Debug + PartialOrd + Copy, V: Debug + Copy> PackedData<K, V> {
 
   pub fn set(&mut self, index: usize, key: K, value: V) -> Arc<Block<K, V>> {
     let block = self.initialize_block(index);
-    let result = block.insert(key, value);
-    println!("{:?}", result);
+    block.insert(key, value);
     block
   }
 }
@@ -497,10 +511,11 @@ mod tests {
   #[test]
   fn blocks() {
     let mut data = PackedData::new(32);
-    let block1 = data.set(0, 15, "Hello");
-    let block2 = data.set(1, 1, "World");
+    let block1 = data.set(0, 1, "Hello");
+    let block2 = data.set(1, 72, "World");
+    block1.insert(2, "Goodbye");
 
-    let cell = block1.insert(16, "Goodbye");
-    println!("{:?}", cell);
+    println!("{:#?}", block1);
+    println!("{:#?}", block2);
   }
 }
