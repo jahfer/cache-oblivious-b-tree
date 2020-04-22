@@ -4,6 +4,9 @@ version = "0.1.0"
 authors = ["Jahfer Husain <echo@jahfer.com>"]
 edition = "2018"
 
+[dependencies]
+memoffset = "0.5"
+
 [dev-dependencies]
 criterion = "0.3"
 

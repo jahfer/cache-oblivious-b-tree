@@ -1,75 +1,69 @@
 #![feature(new_uninit)]
 #![feature(alloc_layout_extra)]
+#![feature(get_mut_unchecked)]
+#![feature(maybe_uninit_ref)]
+#![feature(slice_from_raw_parts)]
+#![feature(maybe_uninit_slice_assume_init)]
+
+#[macro_use]
+extern crate memoffset;
 
 extern crate alloc;
 
-use std::cell::RefCell;
-use std::cmp::{Ord, Ordering, PartialOrd};
-use std::fmt::Debug;
-use std::marker::Copy;
-use std::rc::Rc;
-
 use std::alloc::{alloc, dealloc, Layout};
-use std::ptr::{copy, NonNull};
+use std::cell::{RefCell, UnsafeCell};
+use std::cmp::{Ord, Ordering, PartialOrd};
+use std::fmt::{self, Debug};
+use std::marker::Copy;
+use std::ptr::{self, NonNull};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, Ordering as AtomicOrdering};
+use std::sync::{Arc, RwLock, Weak};
+
+const COUNTER_INIT_VALUE: u16 = 1;
 
 #[derive(Debug)]
-pub struct PackedData<T> {
-  data: NonNull<T>,
-  capacity: usize,
-  length: usize,
-  block_length: usize,
+enum Marker<K, V> {
+  Empty(u16),
+  Move(u16, K, V),
+  InsertCell(u16, K, V),
+  DeleteCell(u16, K),
 }
 
-impl<T> PackedData<T> {
-  pub fn new(capacity: usize) -> Self {
-    PackedData {
-      capacity: capacity,
-      length: 0,
-      block_length: (capacity as f32).log2().ceil() as usize,
-      data: unsafe {
-        let layout = Layout::array::<T>(capacity);
-        let ptr = alloc(layout.unwrap()) as *mut T;
-
-        NonNull::new_unchecked(ptr)
-      },
-    }
-  }
-
-  // pub fn find_in_block(&self, index: usize) -> &T {
-  //   assert!(index < self.capacity);
-  // }
-
-  pub fn insert_at(&mut self, index: usize, value: T) -> usize {
-    assert!(index < self.capacity);
-    unsafe {
-      let ptr = self.data.as_ptr();
-      *(ptr.add(index)) = value;
-    }
-    self.length += 1;
-    index
-  }
-
-  pub fn get(&self, index: usize) -> &T {
-    unsafe {
-      let ptr = self.data.as_ptr();
-      &*(ptr.add(index))
-    }
-  }
+struct CellInner<K, V> {
+  version: u16,
+  marker: Marker<K, V>,
+  empty: bool,
+  key: UnsafeCell<K>,
+  value: UnsafeCell<V>,
 }
 
-impl<T> Drop for PackedData<T> {
-  fn drop(&mut self) {
-    unsafe {
-      let layout = Layout::array::<T>(self.capacity);
-      dealloc(self.data.as_ptr() as *mut u8, layout.unwrap())
-    }
-  }
+pub struct Cell<K, V> {
+  version: NonNull<AtomicU16>,
+  marker: AtomicPtr<Marker<K, V>>,
+  empty: NonNull<AtomicBool>,
+  key: AtomicPtr<K>,
+  value: AtomicPtr<V>,
 }
 
-#[derive(Debug)]
-enum Node<K: Ord + Eq> {
-  Branch(BinaryTree<K>),
-  Leaf { key: K, block_data: usize },
+impl<K: Debug, V: Debug> Debug for Cell<K, V> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let version_ref = unsafe { self.version.as_ref() };
+    let empty_ref = unsafe { self.empty.as_ref() };
+
+    let version = version_ref.load(AtomicOrdering::Acquire);
+    let marker = unsafe { &*self.marker.load(AtomicOrdering::Acquire) };
+    let empty = empty_ref.load(AtomicOrdering::Acquire);
+    let key = unsafe { &*self.key.load(AtomicOrdering::Acquire) };
+    let value = unsafe { &*self.value.load(AtomicOrdering::Acquire) };
+
+    f.debug_struct("Cell")
+      .field("version", &version)
+      .field("marker", marker)
+      .field("empty", &empty)
+      .field("key", key)
+      .field("value", value)
+      .finish()
+  }
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd)]
@@ -77,6 +71,180 @@ enum Element<T: Eq> {
   Infimum,
   Value(T),
   Supremum,
+}
+
+// Return as Arc<Block<K, V>>
+pub struct Block<K: Eq, V> {
+  min_key: Element<K>,
+  max_key: Element<K>,
+  cells: Box<[Cell<K, V>]>,
+}
+
+impl<K: Eq + PartialOrd + Copy + Debug, V: Copy + Debug> Block<K, V> {
+  pub fn insert<'a>(&'a self, key: K, value: V) -> &'a Cell<K, V> {
+    // default to using first slot
+    let mut insertion_cell: &Cell<K, V> = &self.cells[0];
+    for cell in self.cells.iter() {
+      let is_empty = unsafe { cell.empty.as_ref() };
+      if is_empty.load(AtomicOrdering::Acquire) {
+        insertion_cell = cell;
+        break;
+      }
+      let cell_key_ptr = cell.key.load(AtomicOrdering::Acquire);
+      let cell_key = unsafe { &*cell_key_ptr };
+      if *cell_key < key {
+        insertion_cell = cell;
+      } else {
+        break;
+      }
+    }
+
+    loop {
+      let version_ref = unsafe { insertion_cell.version.as_ref() };
+      let empty_ref = unsafe { insertion_cell.empty.as_ref() };
+      let marker_ptr = insertion_cell.marker.load(AtomicOrdering::Acquire);
+
+      let marker = unsafe { &mut *marker_ptr };
+      let current_version = version_ref.load(AtomicOrdering::Acquire);
+
+      match *marker {
+        Marker::Empty(version) => {
+          if version < current_version {
+            println!("Marker out of date. Another process has claimed this cell.");
+            continue;
+          } else if version > current_version {
+            panic!("This should never happen...");
+          }
+        }
+        _ => unimplemented!("TODO: Complete existing marker..."),
+      };
+
+      let empty = empty_ref.load(AtomicOrdering::Acquire);
+      if !empty {
+        panic!("Cell occupied!");
+      }
+
+      let key_slot = insertion_cell.key.load(AtomicOrdering::Acquire);
+      let value_slot = insertion_cell.value.load(AtomicOrdering::Acquire);
+
+      let new_version = current_version + 1;
+
+      // attempt to bump version, "claiming" it
+      match version_ref.compare_exchange(
+        current_version,
+        new_version,
+        AtomicOrdering::AcqRel,
+        AtomicOrdering::Acquire,
+      ) {
+        Ok(_) => {
+          *marker = Marker::InsertCell(new_version, key, value);
+
+          unsafe {
+            key_slot.write(key);
+            value_slot.write(value);
+          };
+
+          empty_ref.store(false, AtomicOrdering::Release);
+
+          *marker = Marker::Empty(new_version);
+          break;
+        }
+        Err(_) => {
+          println!("Version has changed since process began. Restarting.");
+          continue;
+        }
+      }
+    }
+
+    insertion_cell
+  }
+}
+
+pub struct PackedData<K: Eq + Sized, V: Sized> {
+  data: NonNull<CellInner<K, V>>,
+  capacity: usize,
+  block_length: usize,
+}
+
+impl<K: Eq + Debug + PartialOrd + Copy, V: Debug + Copy> PackedData<K, V> {
+  pub fn new(capacity: usize) -> Self {
+    let block_length = (capacity as f32).log2().ceil() as usize;
+    PackedData {
+      capacity,
+      block_length,
+      data: unsafe {
+        let layout = Layout::array::<CellInner<K, V>>(capacity);
+        let ptr = alloc(layout.unwrap()) as *mut CellInner<K, V>;
+        NonNull::new_unchecked(ptr)
+      },
+    }
+  }
+
+  fn initialize_block(&self, block_index: usize) -> Arc<Block<K, V>> {
+    assert!(block_index < self.block_length);
+    unsafe {
+      let block_ptr = self.data.as_ptr().add(self.block_length * block_index);
+      let mut vec = Vec::with_capacity(self.block_length);
+
+      for i in 0..self.block_length {
+        let cell_inner = block_ptr.add(i);
+
+        let field_version = raw_field!(cell_inner, CellInner<K,V>, version) as *mut AtomicU16;
+        let field_marker = raw_field!(cell_inner, CellInner<K,V>, marker) as *mut Marker<K, V>;
+        let field_empty = raw_field!(cell_inner, CellInner<K,V>, empty) as *mut AtomicBool;
+        let field_key = raw_field!(cell_inner, CellInner<K,V>, key) as *mut K;
+        let field_value = raw_field!(cell_inner, CellInner<K,V>, value) as *mut V;
+
+        field_version.write(AtomicU16::new(COUNTER_INIT_VALUE));
+
+        let marker = Marker::Empty(COUNTER_INIT_VALUE);
+        field_marker.write(marker);
+
+        field_empty.write(AtomicBool::new(true));
+
+        vec.push(Cell {
+          version: NonNull::new_unchecked(field_version),
+          marker: AtomicPtr::new(field_marker),
+          empty: NonNull::new_unchecked(field_empty),
+          key: AtomicPtr::new(field_key),
+          value: AtomicPtr::new(field_value),
+        });
+      }
+
+      let block = Block {
+        min_key: Element::Infimum,
+        max_key: Element::Supremum,
+        // prev_block:,
+        // next_block:,
+        cells: vec.into_boxed_slice(),
+      };
+
+      Arc::new(block)
+    }
+  }
+
+  pub fn set(&mut self, index: usize, key: K, value: V) -> Arc<Block<K, V>> {
+    let block = self.initialize_block(index);
+    let result = block.insert(key, value);
+    println!("{:?}", result);
+    block
+  }
+}
+
+impl<K: Eq, V> Drop for PackedData<K, V> {
+  fn drop(&mut self) {
+    unsafe {
+      let layout = Layout::array::<CellInner<K, V>>(self.capacity);
+      dealloc(self.data.as_ptr() as *mut u8, layout.unwrap())
+    }
+  }
+}
+
+/*
+#[derive(Debug)]
+enum Node<K: Ord + Eq, V> {
+  Branch(BinaryTree<K, V>),
+  Leaf { key: K, block_data: Block<K, V> },
 }
 
 impl<T: Eq + Ord> Ord for Element<T> {
@@ -91,14 +259,14 @@ impl<T: Eq + Ord> Ord for Element<T> {
 }
 
 #[derive(Debug)]
-struct BinaryTree<K: Eq + Ord> {
+struct BinaryTree<K: Eq + Ord, V> {
   key: Element<K>,
-  left: Rc<RefCell<Option<Node<K>>>>,
-  right: Rc<RefCell<Option<Node<K>>>>,
+  left: Rc<RefCell<Option<Node<K, V>>>>,
+  right: Rc<RefCell<Option<Node<K, V>>>>,
 }
 
-impl<K: Eq + Ord> BinaryTree<K> {
-  pub fn new() -> BinaryTree<K> {
+impl<K: Eq + Ord, V> BinaryTree<K, V> {
+  pub fn new() -> BinaryTree<K, V> {
     BinaryTree {
       key: Element::Infimum,
       left: Rc::new(RefCell::new(None)),
@@ -107,7 +275,7 @@ impl<K: Eq + Ord> BinaryTree<K> {
   }
 }
 
-fn convert_leaf_to_branch<K: Copy + Ord>(leaf: &Node<K>, new_key: &K) -> Node<K> {
+fn convert_leaf_to_branch<K: Copy + Ord, V>(leaf: &Node<K, V>, new_key: &K) -> Node<K, V> {
   match leaf {
     Node::Leaf { key, block_data } => {
       let new_cell = Rc::new(RefCell::new(None));
@@ -116,7 +284,7 @@ fn convert_leaf_to_branch<K: Copy + Ord>(leaf: &Node<K>, new_key: &K) -> Node<K>
           key: Element::Value(*new_key),
           left: Rc::new(RefCell::new(Some(Node::Leaf {
             key: *key,
-            block_data: *block_data,
+            block_data: Weak::clone(block_data),
           }))),
           right: Rc::clone(&new_cell),
         }
@@ -126,7 +294,7 @@ fn convert_leaf_to_branch<K: Copy + Ord>(leaf: &Node<K>, new_key: &K) -> Node<K>
           left: Rc::clone(&new_cell),
           right: Rc::new(RefCell::new(Some(Node::Leaf {
             key: *key,
-            block_data: *block_data,
+            block_data: Weak::clone(block_data),
           }))),
         }
       };
@@ -137,13 +305,13 @@ fn convert_leaf_to_branch<K: Copy + Ord>(leaf: &Node<K>, new_key: &K) -> Node<K>
   }
 }
 
-impl<K: Copy + Ord + Debug> BinaryTree<K> {
-  pub fn search(&self, search_key: Element<K>) -> Option<usize> {
+impl<K: Copy + Ord + Debug, V> BinaryTree<K, V> {
+  pub fn search(&self, search_key: Element<K>) -> Option<Weak<RwLock<Box<[Option<V>]>>>> {
     if search_key < self.key {
       match &*self.left.borrow() {
         Some(Node::Leaf { key, block_data }) => {
           if Element::Value(*key) == search_key {
-            Some(*block_data)
+            Some(Weak::clone(block_data))
           } else {
             None
           }
@@ -155,7 +323,7 @@ impl<K: Copy + Ord + Debug> BinaryTree<K> {
       match &*self.right.borrow() {
         Some(Node::Leaf { key, block_data }) => {
           if Element::Value(*key) == search_key {
-            Some(*block_data)
+            Some(Weak::clone(block_data))
           } else {
             None
           }
@@ -166,14 +334,14 @@ impl<K: Copy + Ord + Debug> BinaryTree<K> {
     }
   }
 
-  fn search_closest(&self, search_key: Element<K>) -> Option<usize> {
+  fn search_closest(&self, search_key: Element<K>) -> Option<Weak<RwLock<Box<[Option<V>]>>>> {
     if search_key < self.key {
       match &*self.left.borrow() {
         Some(Node::Leaf { key, block_data }) => {
           if search_key < Element::Value(*key) {
             None
           } else {
-            Some(*block_data)
+            Some(Weak::clone(block_data))
           }
         }
         Some(Node::Branch(tree)) => tree.search_closest(search_key),
@@ -181,14 +349,14 @@ impl<K: Copy + Ord + Debug> BinaryTree<K> {
       }
     } else {
       match &*self.right.borrow() {
-        Some(Node::Leaf { key: _, block_data }) => Some(*block_data),
+        Some(Node::Leaf { key: _, block_data }) => Some(Weak::clone(block_data)),
         Some(Node::Branch(tree)) => tree.search_closest(search_key),
         None => None,
       }
     }
   }
 
-  fn fetch_insertion_cell(&self, insertion_key: K) -> Rc<RefCell<Option<Node<K>>>> {
+  fn fetch_insertion_cell(&self, insertion_key: K) -> Rc<RefCell<Option<Node<K, V>>>> {
     if Element::Value(insertion_key) < self.key {
       let mut left_entry = self.left.borrow_mut();
 
@@ -247,10 +415,9 @@ impl<K: Copy + Ord + Debug> BinaryTree<K> {
   }
 }
 
-#[derive(Debug)]
 pub struct CacheObliviousBTreeMap<K: Ord + Eq, V> {
-  packed_dataset: PackedData<V>,
-  tree: BinaryTree<K>,
+  packed_dataset: PackedData<K, V>,
+  tree: BinaryTree<K, V>,
   min_key: Element<K>,
   max_key: Element<K>,
 }
@@ -267,18 +434,19 @@ impl<K: Ord + Eq, V> CacheObliviousBTreeMap<K, V> {
 }
 
 impl<K: Copy + Debug + Ord, V: Copy + Debug> CacheObliviousBTreeMap<K, V> {
-  pub fn get(&self, key: K) -> Option<&V> {
+  pub fn get(&self, key: K) -> Option<V> {
     self
       .tree
       .search(Element::Value(key))
-      .map(|idx| self.packed_dataset.get(idx))
+      .and_then(|weak| weak.upgrade())
+      .map(|block| block.read().unwrap()[0].unwrap())
   }
 
   pub fn insert(&mut self, key: K, value: V) {
     match self.tree.search_closest(Element::Value(key)) {
       Some(i) => {
         println!("Closest block {:?} found for key {:?}", i, key);
-        let inserted_index = self.packed_dataset.insert_at(i + 1, value);
+        let inserted_index = self.packed_dataset.insert(i, value);
         let cell = self.tree.fetch_insertion_cell(key);
         let new_leaf = Node::Leaf {
           key,
@@ -288,7 +456,7 @@ impl<K: Copy + Debug + Ord, V: Copy + Debug> CacheObliviousBTreeMap<K, V> {
       }
       None => {
         println!("No closest block found for key {:?}", key);
-        let inserted_index = self.packed_dataset.insert_at(0, value);
+        let inserted_index = self.packed_dataset.set(0, value);
         let cell = self.tree.fetch_insertion_cell(key);
         let new_leaf = Node::Leaf {
           key,
@@ -298,23 +466,23 @@ impl<K: Copy + Debug + Ord, V: Copy + Debug> CacheObliviousBTreeMap<K, V> {
       }
     }
   }
-}
+}*/
 
 #[cfg(test)]
 mod tests {
   use super::*;
 
   #[test]
-  fn it_works() {
+  /*fn it_works() {
     let mut map = CacheObliviousBTreeMap::new(32);
     map.insert(5, "Hello");
     map.insert(3, "World");
     map.insert(2, "!");
 
-    assert_eq!(map.get(5), Some(&"Hello"));
+    assert_eq!(map.get(5), Some("Hello"));
     assert_eq!(map.get(4), None);
-    assert_eq!(map.get(3), Some(&"World"));
-    assert_eq!(map.get(2), Some(&"!"));
+    assert_eq!(map.get(3), Some("World"));
+    assert_eq!(map.get(2), Some("!"));
   }
 
   #[test]
@@ -324,15 +492,18 @@ mod tests {
     map.insert(8, "World");
     map.insert(12, "!");
 
-    assert_eq!(map.get(3), Some(&"Hello"));
+    assert_eq!(map.get(3), Some("Hello"));
     assert_eq!(map.get(4), None);
-    assert_eq!(map.get(8), Some(&"World"));
-    assert_eq!(map.get(12), Some(&"!"));
-  }
-
+    assert_eq!(map.get(8), Some("World"));
+    assert_eq!(map.get(12), Some("!"));
+  }*/
   #[test]
   fn blocks() {
-    let mut map: CacheObliviousBTreeMap<i32, &str> = CacheObliviousBTreeMap::new(16);
-    map.insert(3, "Hello");
+    let mut data = PackedData::new(32);
+    let block1 = data.set(0, 15, "Hello");
+    let block2 = data.set(1, 1, "World");
+
+    let cell = block1.insert(16, "Goodbye");
+    println!("{:?}", cell);
   }
 }
