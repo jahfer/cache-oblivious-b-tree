@@ -6,13 +6,12 @@ extern crate memoffset;
 extern crate alloc;
 
 use std::alloc::{alloc, dealloc, Layout};
-use std::cell::{RefCell, UnsafeCell};
 use std::cmp::{Ord, Ordering, PartialOrd};
 use std::fmt::{self, Debug};
 use std::marker::Copy;
-use std::ptr::{self, NonNull};
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, Ordering as AtomicOrdering};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::Arc;
 
 const COUNTER_INIT_VALUE: u16 = 1;
 
@@ -68,9 +67,20 @@ enum Element<T: Eq> {
   Supremum,
 }
 
+impl<T: Eq + Ord> Ord for Element<T> {
+  fn cmp(&self, other: &Self) -> Ordering {
+    match (self, other) {
+      (x, y) if x == y => Ordering::Equal,
+      (Element::Infimum, _) | (_, Element::Supremum) => Ordering::Less,
+      (Element::Supremum, _) | (_, Element::Infimum) => Ordering::Greater,
+      (Element::Value(a), Element::Value(b)) => a.cmp(b),
+    }
+  }
+}
+
 // Return as Arc<Block<K, V>>
 pub struct Block<K: Eq, V> {
-  min_key: Element<K>,
+  min_key: Element<K>, // TODO: update
   max_key: Element<K>,
   cells: Box<[Cell<K, V>]>,
 }
@@ -79,18 +89,21 @@ impl<K: Eq + PartialOrd + Copy + Debug, V: Copy + Debug> Block<K, V> {
   pub fn insert<'a>(&'a self, key: K, value: V) -> &'a Cell<K, V> {
     // default to using first slot
     let mut insertion_cell: &Cell<K, V> = &self.cells[0];
-    for cell in self.cells.iter() {
-      let is_empty = unsafe { cell.empty.as_ref() };
-      if is_empty.load(AtomicOrdering::Acquire) {
-        insertion_cell = cell;
-        break;
-      }
-      let cell_key_ptr = cell.key.load(AtomicOrdering::Acquire);
-      let cell_key = unsafe { &*cell_key_ptr };
-      if *cell_key < key {
-        insertion_cell = cell;
-      } else {
-        break;
+
+    if self.min_key < Element::Value(key) {
+      for cell in self.cells.iter() {
+        let is_empty = unsafe { cell.empty.as_ref() };
+        if is_empty.load(AtomicOrdering::Acquire) {
+          insertion_cell = cell;
+          break;
+        }
+        let cell_key_ptr = cell.key.load(AtomicOrdering::Acquire);
+        let cell_key = unsafe { &*cell_key_ptr };
+        if *cell_key < key {
+          insertion_cell = cell;
+        } else {
+          break;
+        }
       }
     }
 
@@ -240,17 +253,6 @@ impl<K: Eq, V> Drop for PackedData<K, V> {
 enum Node<K: Ord + Eq, V> {
   Branch(BinaryTree<K, V>),
   Leaf { key: K, block_data: Block<K, V> },
-}
-
-impl<T: Eq + Ord> Ord for Element<T> {
-  fn cmp(&self, other: &Self) -> Ordering {
-    match (self, other) {
-      (x, y) if x == y => Ordering::Equal,
-      (Element::Infimum, _) | (_, Element::Supremum) => Ordering::Less,
-      (Element::Supremum, _) | (_, Element::Infimum) => Ordering::Greater,
-      (Element::Value(a), Element::Value(b)) => a.cmp(b),
-    }
-  }
 }
 
 #[derive(Debug)]
