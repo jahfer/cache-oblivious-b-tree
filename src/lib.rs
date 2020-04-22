@@ -6,12 +6,14 @@ extern crate memoffset;
 extern crate alloc;
 
 use std::alloc::{alloc, dealloc, Layout};
+use std::cell::RefCell;
 use std::cmp::{Ord, Ordering, PartialOrd};
 use std::fmt::{self, Debug};
 use std::marker::Copy;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, Ordering as AtomicOrdering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 
 const COUNTER_INIT_VALUE: u16 = 1;
 
@@ -37,6 +39,37 @@ pub struct Cell<K, V> {
   empty: NonNull<AtomicBool>,
   key: AtomicPtr<K>,
   value: AtomicPtr<V>,
+}
+
+impl<K: Copy, V: Copy> Cell<K, V> {
+  pub fn key(&self) -> Option<K> {
+    if self.is_empty() {
+      None
+    } else {
+      Some(self.get_key())
+    }
+  }
+
+  pub fn value(&self) -> Option<V> {
+    if self.is_empty() {
+      None
+    } else {
+      Some(self.get_value())
+    }
+  }
+
+  fn is_empty(&self) -> bool {
+    let empty_ref = unsafe { &*self.empty.as_ref() };
+    empty_ref.load(AtomicOrdering::Acquire)
+  }
+
+  fn get_value(&self) -> V {
+    unsafe { *self.value.load(AtomicOrdering::Acquire) }
+  }
+
+  fn get_key(&self) -> K {
+    unsafe { *self.key.load(AtomicOrdering::Acquire) }
+  }
 }
 
 impl<K: Debug, V: Debug> Debug for Cell<K, V> {
@@ -93,6 +126,18 @@ pub struct Block<K: Eq, V> {
   cells: Box<[Cell<K, V>]>,
 }
 
+impl<K: Eq + Copy + Debug, V: Copy + Debug> Block<K, V> {
+  pub fn get(&self, key: K) -> Option<V> {
+    for cell in self.cells.iter() {
+      match cell.key() {
+        Some(k) if k == key => return cell.value(),
+        _ => continue,
+      }
+    }
+    None
+  }
+}
+
 impl<K: Eq + PartialOrd + Copy + Debug, V: Copy + Debug> Block<K, V> {
   pub fn insert<'a>(&'a self, key: K, value: V) -> &'a Cell<K, V> {
     // default to using first slot
@@ -140,7 +185,7 @@ impl<K: Eq + PartialOrd + Copy + Debug, V: Copy + Debug> Block<K, V> {
 
       let empty = empty_ref.load(AtomicOrdering::Acquire);
       if !empty {
-        panic!("Cell occupied!");
+        // unimplemented!("Cell occupied!");
       }
 
       let key_slot = insertion_cell.key.load(AtomicOrdering::Acquire);
@@ -262,11 +307,13 @@ impl<K: Eq, V> Drop for PackedData<K, V> {
   }
 }
 
-/*
 #[derive(Debug)]
 enum Node<K: Ord + Eq, V> {
   Branch(BinaryTree<K, V>),
-  Leaf { key: K, block_data: Block<K, V> },
+  Leaf {
+    key: K,
+    block_data: Arc<Block<K, V>>,
+  },
 }
 
 #[derive(Debug)]
@@ -295,7 +342,7 @@ fn convert_leaf_to_branch<K: Copy + Ord, V>(leaf: &Node<K, V>, new_key: &K) -> N
           key: Element::Value(*new_key),
           left: Rc::new(RefCell::new(Some(Node::Leaf {
             key: *key,
-            block_data: Weak::clone(block_data),
+            block_data: Arc::clone(block_data),
           }))),
           right: Rc::clone(&new_cell),
         }
@@ -305,7 +352,7 @@ fn convert_leaf_to_branch<K: Copy + Ord, V>(leaf: &Node<K, V>, new_key: &K) -> N
           left: Rc::clone(&new_cell),
           right: Rc::new(RefCell::new(Some(Node::Leaf {
             key: *key,
-            block_data: Weak::clone(block_data),
+            block_data: Arc::clone(block_data),
           }))),
         }
       };
@@ -317,12 +364,12 @@ fn convert_leaf_to_branch<K: Copy + Ord, V>(leaf: &Node<K, V>, new_key: &K) -> N
 }
 
 impl<K: Copy + Ord + Debug, V> BinaryTree<K, V> {
-  pub fn search(&self, search_key: Element<K>) -> Option<Weak<RwLock<Box<[Option<V>]>>>> {
+  pub fn search(&self, search_key: Element<K>) -> Option<Weak<Block<K, V>>> {
     if search_key < self.key {
       match &*self.left.borrow() {
         Some(Node::Leaf { key, block_data }) => {
           if Element::Value(*key) == search_key {
-            Some(Weak::clone(block_data))
+            Some(Arc::downgrade(block_data))
           } else {
             None
           }
@@ -334,7 +381,7 @@ impl<K: Copy + Ord + Debug, V> BinaryTree<K, V> {
       match &*self.right.borrow() {
         Some(Node::Leaf { key, block_data }) => {
           if Element::Value(*key) == search_key {
-            Some(Weak::clone(block_data))
+            Some(Arc::downgrade(block_data))
           } else {
             None
           }
@@ -345,14 +392,14 @@ impl<K: Copy + Ord + Debug, V> BinaryTree<K, V> {
     }
   }
 
-  fn search_closest(&self, search_key: Element<K>) -> Option<Weak<RwLock<Box<[Option<V>]>>>> {
+  fn search_closest(&self, search_key: Element<K>) -> Option<Weak<Block<K, V>>> {
     if search_key < self.key {
       match &*self.left.borrow() {
         Some(Node::Leaf { key, block_data }) => {
           if search_key < Element::Value(*key) {
             None
           } else {
-            Some(Weak::clone(block_data))
+            Some(Arc::downgrade(block_data))
           }
         }
         Some(Node::Branch(tree)) => tree.search_closest(search_key),
@@ -360,7 +407,7 @@ impl<K: Copy + Ord + Debug, V> BinaryTree<K, V> {
       }
     } else {
       match &*self.right.borrow() {
-        Some(Node::Leaf { key: _, block_data }) => Some(Weak::clone(block_data)),
+        Some(Node::Leaf { key: _, block_data }) => Some(Arc::downgrade(block_data)),
         Some(Node::Branch(tree)) => tree.search_closest(search_key),
         None => None,
       }
@@ -429,17 +476,13 @@ impl<K: Copy + Ord + Debug, V> BinaryTree<K, V> {
 pub struct CacheObliviousBTreeMap<K: Ord + Eq, V> {
   packed_dataset: PackedData<K, V>,
   tree: BinaryTree<K, V>,
-  min_key: Element<K>,
-  max_key: Element<K>,
 }
 
-impl<K: Ord + Eq, V> CacheObliviousBTreeMap<K, V> {
+impl<K: Ord + Eq + Copy + Debug, V: Copy + Debug> CacheObliviousBTreeMap<K, V> {
   pub fn new(size: usize) -> Self {
     CacheObliviousBTreeMap {
       packed_dataset: PackedData::new(size),
       tree: BinaryTree::new(),
-      min_key: Element::Infimum,
-      max_key: Element::Supremum,
     }
   }
 }
@@ -450,24 +493,23 @@ impl<K: Copy + Debug + Ord, V: Copy + Debug> CacheObliviousBTreeMap<K, V> {
       .tree
       .search(Element::Value(key))
       .and_then(|weak| weak.upgrade())
-      .map(|block| block.read().unwrap()[0].unwrap())
+      .and_then(|block| block.get(key))
   }
 
   pub fn insert(&mut self, key: K, value: V) {
     match self.tree.search_closest(Element::Value(key)) {
-      Some(i) => {
-        println!("Closest block {:?} found for key {:?}", i, key);
-        let inserted_index = self.packed_dataset.insert(i, value);
+      Some(block_ref) => {
+        let block = block_ref.upgrade().unwrap();
+        let _inserted_index = block.insert(key, value);
         let cell = self.tree.fetch_insertion_cell(key);
         let new_leaf = Node::Leaf {
           key,
-          block_data: inserted_index,
+          block_data: Arc::clone(&block), // todo this doesn't seem right at all...
         };
         cell.replace(Some(new_leaf));
       }
       None => {
-        println!("No closest block found for key {:?}", key);
-        let inserted_index = self.packed_dataset.set(0, value);
+        let inserted_index = self.packed_dataset.set(0, key, value);
         let cell = self.tree.fetch_insertion_cell(key);
         let new_leaf = Node::Leaf {
           key,
@@ -477,27 +519,22 @@ impl<K: Copy + Debug + Ord, V: Copy + Debug> CacheObliviousBTreeMap<K, V> {
       }
     }
   }
-}*/
+}
 
 #[cfg(test)]
 mod tests {
   use super::*;
 
   #[test]
-  /*fn it_works() {
-    let mut map = CacheObliviousBTreeMap::new(32);
-    map.insert(5, "Hello");
-    map.insert(3, "World");
-    map.insert(2, "!");
-
-    assert_eq!(map.get(5), Some("Hello"));
-    assert_eq!(map.get(4), None);
-    assert_eq!(map.get(3), Some("World"));
-    assert_eq!(map.get(2), Some("!"));
+  fn packed_data_blocks() {
+    let mut data = PackedData::new(32);
+    let block1 = data.set(0, 1, "Hello");
+    let _block2 = data.set(1, 72, "World");
+    block1.insert(2, "Goodbye");
   }
 
   #[test]
-  fn it_still_works() {
+  fn insert_and_get() {
     let mut map = CacheObliviousBTreeMap::new(32);
     map.insert(3, "Hello");
     map.insert(8, "World");
@@ -507,15 +544,18 @@ mod tests {
     assert_eq!(map.get(4), None);
     assert_eq!(map.get(8), Some("World"));
     assert_eq!(map.get(12), Some("!"));
-  }*/
-  #[test]
-  fn blocks() {
-    let mut data = PackedData::new(32);
-    let block1 = data.set(0, 1, "Hello");
-    let block2 = data.set(1, 72, "World");
-    block1.insert(2, "Goodbye");
+  }
 
-    println!("{:#?}", block1);
-    println!("{:#?}", block2);
+  #[test]
+  fn move_cells() {
+    let mut map = CacheObliviousBTreeMap::new(32);
+    map.insert(5, "Hello");
+    map.insert(3, "World");
+    map.insert(2, "!");
+
+    assert_eq!(map.get(5), Some("Hello"));
+    assert_eq!(map.get(4), None);
+    assert_eq!(map.get(3), Some("World"));
+    assert_eq!(map.get(2), Some("!"));
   }
 }
