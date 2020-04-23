@@ -157,14 +157,12 @@ impl<K: Eq + PartialOrd + Copy + Debug, V: Copy + Debug> Block<K, V> {
 
     if !replace_min_key {
       for cell in self.cells.iter() {
-        let is_empty = unsafe { cell.empty.as_ref() };
-        if is_empty.load(AtomicOrdering::Acquire) {
+        if cell.is_empty() {
           insertion_cell = cell;
           break;
         }
-        let cell_key_ptr = cell.key.load(AtomicOrdering::Acquire);
-        let cell_key = unsafe { &*cell_key_ptr };
-        if *cell_key < key {
+        let cell_key = cell.key().unwrap();
+        if cell_key < key {
           insertion_cell = cell;
         } else {
           break;
