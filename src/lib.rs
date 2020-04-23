@@ -13,7 +13,7 @@ use std::marker::Copy;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, Ordering as AtomicOrdering};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::Arc;
 
 const COUNTER_INIT_VALUE: u16 = 1;
 
@@ -121,9 +121,19 @@ impl<T: Eq + Ord> Ord for Element<T> {
 
 #[derive(Debug)]
 pub struct Block<K: Eq, V> {
-  min_key: RwLock<Element<K>>, // TODO: use AtomicPtr for updates?
-  max_key: RwLock<Element<K>>,
-  cells: Box<[Cell<K, V>]>,
+  min_key: Element<K>, // TODO: use AtomicPtr for update?
+  max_key: Element<K>,
+  cells: Arc<[Cell<K, V>]>,
+}
+
+impl<K: Eq + Copy, V> Clone for Block<K, V> {
+  fn clone(&self) -> Self {
+    Block {
+      min_key: self.min_key,
+      max_key: self.max_key,
+      cells: Arc::clone(&self.cells),
+    }
+  }
 }
 
 impl<K: Eq + Copy + Debug, V: Copy + Debug> Block<K, V> {
@@ -139,12 +149,11 @@ impl<K: Eq + Copy + Debug, V: Copy + Debug> Block<K, V> {
 }
 
 impl<K: Eq + PartialOrd + Copy + Debug, V: Copy + Debug> Block<K, V> {
-  pub fn insert<'a>(&'a self, key: K, value: V) -> &'a Cell<K, V> {
+  pub fn insert<'a>(&self, key: K, value: V) -> Block<K, V> {
     // default to using first slot
     let mut insertion_cell: &Cell<K, V> = &self.cells[0];
 
-    let block_min_key = *self.min_key.read().unwrap();
-    let replace_min_key = block_min_key == Element::Infimum || block_min_key > Element::Value(key);
+    let replace_min_key = false; // self.min_key == Element::Infimum || self.min_key > Element::Value(key);
 
     if !replace_min_key {
       for cell in self.cells.iter() {
@@ -220,11 +229,17 @@ impl<K: Eq + PartialOrd + Copy + Debug, V: Copy + Debug> Block<K, V> {
       }
     }
 
-    if replace_min_key {
-      *self.min_key.try_write().unwrap() = Element::Value(key);
-    }
+    let min_key = if replace_min_key {
+      Element::Value(key)
+    } else {
+      self.min_key
+    };
 
-    insertion_cell
+    Block {
+      min_key,
+      max_key: self.max_key,
+      cells: Arc::clone(&self.cells),
+    }
   }
 }
 
@@ -248,7 +263,7 @@ impl<K: Eq + Debug + PartialOrd + Copy, V: Debug + Copy> PackedData<K, V> {
     }
   }
 
-  fn initialize_block(&self, block_index: usize) -> Arc<Block<K, V>> {
+  fn initialize_block(&self, block_index: usize) -> Block<K, V> {
     assert!(block_index < self.block_length);
     unsafe {
       let block_ptr = self.data.as_ptr().add(self.block_length * block_index);
@@ -279,19 +294,17 @@ impl<K: Eq + Debug + PartialOrd + Copy, V: Debug + Copy> PackedData<K, V> {
         });
       }
 
-      let block = Block {
-        min_key: RwLock::new(Element::Infimum),
-        max_key: RwLock::new(Element::Supremum),
+      Block {
+        min_key: Element::Infimum,
+        max_key: Element::Supremum,
         // prev_block:,
         // next_block:,
-        cells: vec.into_boxed_slice(),
-      };
-
-      Arc::new(block)
+        cells: Arc::from(vec),
+      }
     }
   }
 
-  pub fn set(&mut self, index: usize, key: K, value: V) -> Arc<Block<K, V>> {
+  pub fn set(&mut self, index: usize, key: K, value: V) -> Block<K, V> {
     let block = self.initialize_block(index);
     block.insert(key, value);
     block
@@ -310,10 +323,7 @@ impl<K: Eq, V> Drop for PackedData<K, V> {
 #[derive(Debug)]
 enum Node<K: Ord + Eq, V> {
   Branch(BinaryTree<K, V>),
-  Leaf {
-    key: K,
-    block_data: Arc<Block<K, V>>,
-  },
+  Leaf { key: K, block_data: Block<K, V> },
 }
 
 #[derive(Debug)]
@@ -342,7 +352,7 @@ fn convert_leaf_to_branch<K: Copy + Ord, V>(leaf: &Node<K, V>, new_key: &K) -> N
           key: Element::Value(*new_key),
           left: Rc::new(RefCell::new(Some(Node::Leaf {
             key: *key,
-            block_data: Arc::clone(block_data),
+            block_data: block_data.clone(),
           }))),
           right: Rc::clone(&new_cell),
         }
@@ -352,7 +362,7 @@ fn convert_leaf_to_branch<K: Copy + Ord, V>(leaf: &Node<K, V>, new_key: &K) -> N
           left: Rc::clone(&new_cell),
           right: Rc::new(RefCell::new(Some(Node::Leaf {
             key: *key,
-            block_data: Arc::clone(block_data),
+            block_data: block_data.clone(),
           }))),
         }
       };
@@ -364,12 +374,12 @@ fn convert_leaf_to_branch<K: Copy + Ord, V>(leaf: &Node<K, V>, new_key: &K) -> N
 }
 
 impl<K: Copy + Ord + Debug, V> BinaryTree<K, V> {
-  pub fn search(&self, search_key: Element<K>) -> Option<Weak<Block<K, V>>> {
+  pub fn search(&self, search_key: Element<K>) -> Option<Block<K, V>> {
     if search_key < self.key {
       match &*self.left.borrow() {
         Some(Node::Leaf { key, block_data }) => {
           if Element::Value(*key) == search_key {
-            Some(Arc::downgrade(block_data))
+            Some(block_data.clone())
           } else {
             None
           }
@@ -381,7 +391,7 @@ impl<K: Copy + Ord + Debug, V> BinaryTree<K, V> {
       match &*self.right.borrow() {
         Some(Node::Leaf { key, block_data }) => {
           if Element::Value(*key) == search_key {
-            Some(Arc::downgrade(block_data))
+            Some(block_data.clone())
           } else {
             None
           }
@@ -392,14 +402,14 @@ impl<K: Copy + Ord + Debug, V> BinaryTree<K, V> {
     }
   }
 
-  fn search_closest(&self, search_key: Element<K>) -> Option<Weak<Block<K, V>>> {
+  fn search_closest(&self, search_key: Element<K>) -> Option<Block<K, V>> {
     if search_key < self.key {
       match &*self.left.borrow() {
         Some(Node::Leaf { key, block_data }) => {
           if search_key < Element::Value(*key) {
             None
           } else {
-            Some(Arc::downgrade(block_data))
+            Some(block_data.clone())
           }
         }
         Some(Node::Branch(tree)) => tree.search_closest(search_key),
@@ -407,7 +417,7 @@ impl<K: Copy + Ord + Debug, V> BinaryTree<K, V> {
       }
     } else {
       match &*self.right.borrow() {
-        Some(Node::Leaf { key: _, block_data }) => Some(Arc::downgrade(block_data)),
+        Some(Node::Leaf { key: _, block_data }) => Some(block_data.clone()),
         Some(Node::Branch(tree)) => tree.search_closest(search_key),
         None => None,
       }
@@ -492,19 +502,18 @@ impl<K: Copy + Debug + Ord, V: Copy + Debug> CacheObliviousBTreeMap<K, V> {
     self
       .tree
       .search(Element::Value(key))
-      .and_then(|weak| weak.upgrade())
       .and_then(|block| block.get(key))
   }
 
   pub fn insert(&mut self, key: K, value: V) {
     match self.tree.search_closest(Element::Value(key)) {
-      Some(block_ref) => {
-        let block = block_ref.upgrade().unwrap();
-        let _inserted_index = block.insert(key, value);
+      Some(block) => {
+        let new_block = block.insert(key, value);
+        // TODO swap block with new_block in tree
         let cell = self.tree.fetch_insertion_cell(key);
         let new_leaf = Node::Leaf {
           key,
-          block_data: Arc::clone(&block), // todo this doesn't seem right at all...
+          block_data: block, // todo this doesn't seem right at all...
         };
         cell.replace(Some(new_leaf));
       }
