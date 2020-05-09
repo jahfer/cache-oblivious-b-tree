@@ -1,11 +1,12 @@
-#![feature(alloc_layout_extra)]
+#![feature(new_uninit)]
+#![feature(box_into_pin)]
 
 #[macro_use]
 extern crate memoffset;
 extern crate alloc;
 
 mod cache_oblivious;
-pub use cache_oblivious::{CacheObliviousBTreeMap, PackedData};
+pub use cache_oblivious::{CacheObliviousBTreeMap, PackedData, StaticSearchTree};
 
 #[cfg(test)]
 mod tests {
