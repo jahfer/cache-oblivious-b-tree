@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::cmp::{Ord, Ordering};
 use std::marker::PhantomPinned;
 use std::mem::MaybeUninit;
@@ -28,8 +29,8 @@ enum Node<K, V> {
   Leaf(K, AtomicPtr<V>),
   Branch {
     min_rhs: Element<K>,
-    left: AtomicPtr<Node<K, V>>,
-    right: AtomicPtr<Node<K, V>>,
+    left: MaybeUninit<UnsafeCell<NonNull<Node<K, V>>>>,
+    right: MaybeUninit<UnsafeCell<NonNull<Node<K, V>>>>,
   },
   Dummy(usize),
 }
@@ -60,17 +61,42 @@ impl<K, V> StaticSearchTree<K, V> {
     Box::into_pin(memory)
   }
 
-  fn init_nodes(memory: &mut [MaybeUninit<Node<K, V>>]) -> () {
+  fn init_nodes<'a>(
+    memory: &'a mut [MaybeUninit<Node<K, V>>],
+    parent_node: Option<&mut MaybeUninit<UnsafeCell<NonNull<Node<K, V>>>>>,
+  ) -> Vec<UnsafeCell<NonNull<Node<K, V>>>> {
     let node_count = memory.len();
 
     if node_count <= 3 {
       for i in 0..node_count as usize {
         unsafe {
           let node_ptr = memory[i].as_mut_ptr();
-          node_ptr.write(Node::Dummy(i));
+          node_ptr.write(Node::Branch {
+            min_rhs: Element::Supremum,
+            left: MaybeUninit::uninit(),
+            right: MaybeUninit::uninit(),
+          });
         }
       }
-      return;
+
+      let raw_parent_node = unsafe { memory[0].get_ref() };
+
+      let leaf = UnsafeCell::new(NonNull::from(raw_parent_node));
+      match parent_node {
+        Some(node) => {
+          node.write(leaf);
+        }
+        None => {}
+      };
+
+      if node_count == 1 {
+        let leaf = UnsafeCell::new(NonNull::from(raw_parent_node));
+        return vec![leaf];
+      }
+
+      let leaf_a = UnsafeCell::new(NonNull::from(unsafe { memory[1].get_ref() }));
+      let leaf_b = UnsafeCell::new(NonNull::from(unsafe { memory[2].get_ref() }));
+      return vec![leaf_a, leaf_b];
     }
 
     let height = f32::log2(node_count as f32 + 1f32);
@@ -79,15 +105,34 @@ impl<K, V> StaticSearchTree<K, V> {
 
     let upper_subtree_length = 2 << (upper_height - 1);
     let (upper_subtree_mem, remaining_mem) = memory.split_at_mut(upper_subtree_length - 1);
-    Self::init_nodes(upper_subtree_mem);
+
+    let mut leaves_of_upper = Self::init_nodes(upper_subtree_mem, parent_node);
 
     let lower_branch_count = upper_subtree_length;
     let cells_per_branch = remaining_mem.len() / lower_branch_count;
 
-    // Parallelize?
-    for subtree_mem in remaining_mem.chunks_exact_mut(cells_per_branch) {
-      Self::init_nodes(subtree_mem);
-    }
+    let mut branches = remaining_mem.chunks_exact_mut(cells_per_branch);
+
+    leaves_of_upper
+      .iter_mut()
+      .flat_map(|leaf| {
+        let ptr = unsafe { (*leaf.get()).as_mut() };
+        match ptr {
+          Node::Dummy(_) => unreachable!(),
+          Node::Leaf(_, _) => unreachable!(),
+          Node::Branch {
+            min_rhs: _,
+            left,
+            right,
+          } => {
+            let mut lhs = Self::init_nodes(branches.next().unwrap(), Some(left));
+            let mut rhs = Self::init_nodes(branches.next().unwrap(), Some(right));
+            lhs.append(&mut rhs);
+            lhs
+          }
+        }
+      })
+      .collect::<Vec<_>>()
   }
 
   fn allocate_tree(packed_memory: Pin<Box<[MaybeUninit<V>]>>) -> Pin<Box<[Node<K, V>]>> {
@@ -96,12 +141,23 @@ impl<K, V> StaticSearchTree<K, V> {
     let slot_size = f32::log2(size as f32) as u32;
     let leaf_count = size / slot_size;
     let node_count = 2 * leaf_count - 1;
+    println!("tree has {:?} leaves, {:?} nodes", leaf_count, node_count);
 
-    let mut uninit_mem = Box::<[Node<K, V>]>::new_uninit_slice(node_count as usize);
-    Self::init_nodes(&mut uninit_mem);
-    let nodes = unsafe { uninit_mem.assume_init() };
+    let uninit_mem = Box::<[Node<K, V>]>::new_uninit_slice(node_count as usize);
+    let mut pinned_mem = Box::into_pin(uninit_mem);
+    let mut_ref = Pin::as_mut(&mut pinned_mem);
+    let mut mem = unsafe { Pin::get_unchecked_mut(mut_ref) };
+    let leaves = Self::init_nodes(&mut mem, None);
+    println!("counted {:?} total leaves", leaves.len());
+    println!("{:?}", leaves);
 
-    Box::into_pin(nodes)
+    let pinned_mem = {
+      let raw_mem = unsafe { Pin::into_inner_unchecked(pinned_mem) };
+      let nodes = unsafe { raw_mem.assume_init() };
+      Box::into_pin(nodes)
+    };
+
+    pinned_mem
   }
 
   fn values_mem_size(num_elements: u32) -> u32 {
@@ -119,5 +175,5 @@ impl<K, V> StaticSearchTree<K, V> {
 
 #[test]
 fn test() {
-  let _tree = StaticSearchTree::<u8, &str>::new(30);
+  let _tree = StaticSearchTree::<u8, &str>::new(1);
 }
