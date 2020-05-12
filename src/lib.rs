@@ -2,17 +2,26 @@
 #![feature(box_into_pin)]
 #![feature(maybe_uninit_ref)]
 #![feature(maybe_uninit_extra)]
+#![feature(maybe_uninit_slice_assume_init)]
 
 // #[macro_use]
 // extern crate memoffset;
 // extern crate alloc;
 
 mod cache_oblivious;
+pub use cache_oblivious::StaticSearchTree;
 // pub use cache_oblivious::{CacheObliviousBTreeMap, PackedData, StaticSearchTree};
 
 #[cfg(test)]
 mod tests {
-  // use crate::{CacheObliviousBTreeMap, PackedData};
+  use crate::StaticSearchTree;
+
+  #[test]
+  fn test() {
+    let tree = StaticSearchTree::<u8, &str>::new(30);
+    let leaf_block = tree.sample();
+    println!("leaf: {:?}", leaf_block.get(1));
+  }
 
   // #[test]
   // fn packed_data_blocks() {
