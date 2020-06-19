@@ -18,9 +18,8 @@ mod tests {
 
   #[test]
   fn test() {
-    let tree = StaticSearchTree::<u8, &str>::new(30);
-    let leaf_block = tree.sample();
-    println!("leaf: {:?}", leaf_block.get(1));
+    let mut tree = StaticSearchTree::<u8, &str>::new(3);
+    println!("{:?}", tree);
   }
 
   // #[test]
