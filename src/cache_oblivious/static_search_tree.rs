@@ -41,10 +41,17 @@ pub struct Cell<'a, K: 'a, V: 'a> {
   _marker: PhantomData<&'a Marker<K, V>>,
 }
 
+impl<K, V> Drop for Cell<'_, K, V> {
+  fn drop(&mut self) {
+    let marker = self.marker.load(AtomicOrdering::Acquire);
+    unsafe { Box::from_raw(marker) };
+  }
+}
+
 impl<K: Debug, V: Debug> Debug for Cell<'_, K, V> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     let version = self.version.load(AtomicOrdering::Acquire);
-    let marker = unsafe { Box::from_raw(self.marker.load(AtomicOrdering::Acquire)) };
+    let marker = unsafe { &*self.marker.load(AtomicOrdering::Acquire) };
     let empty = unsafe { *self.empty.get() };
     let key = unsafe { &*self.key.get() };
     let value = unsafe { &*self.value.get() };
@@ -53,7 +60,7 @@ impl<K: Debug, V: Debug> Debug for Cell<'_, K, V> {
 
     dbg_struct
       .field("version", &version)
-      .field("marker", &*marker)
+      .field("marker", marker)
       .field("empty", &empty);
 
     if empty {
@@ -76,10 +83,10 @@ pub struct Block<'a, K: Eq + Ord, V> {
 }
 
 impl<K: Eq + Ord, V> Block<'_, K, V> {
-  pub fn get(&self, _key: K) -> (&AtomicU16, &Option<V>) {
-    let cell = &self.cell_slice()[0];
-    (&cell.version, unsafe { &*cell.value.get() })
-  }
+  // pub fn get(&self, _key: K) -> (&AtomicU16, &Option<V>) {
+  //   let cell = &self.cell_slice()[0];
+  //   (&cell.version, unsafe { &*cell.value.get() })
+  // }
 
   fn cell_slice(&self) -> &[Cell<K, V>] {
     unsafe { slice::from_raw_parts(self.cells, self.length) }
@@ -94,7 +101,7 @@ impl<K: Eq + Ord + Debug, V: Debug> Debug for Block<'_, K, V> {
         "range",
         &format_args!("[{:?}..{:?}]", &self.min_key, &self.max_key),
       )
-      .field("cells", &self.cell_slice())
+      .field("cells", &format_args!("{:?}", self.cell_slice()))
       .finish()
   }
 }
@@ -220,7 +227,8 @@ where
   V: std::fmt::Debug + 'a,
 {
   pub fn add(&mut self, key: K, _value: V) -> bool {
-    let _block = self.root().locate_block_for_insertion(Key::Value(key));
+    let block = self.root().locate_block_for_insertion(Key::Value(key));
+    println!("Found block for insertion: {:?}", block);
     false
   }
 
@@ -228,9 +236,8 @@ where
     let mut cells = Self::allocate_leaf_cells(num_keys);
     let mut nodes = Self::allocate_nodes(cells.len());
 
-    let size = num_keys;
-    // https://github.com/rust-lang/rust/issues/70887
-    let slot_size = f32::log2(size as f32) as usize;
+    let size = cells.len();
+    let slot_size = f32::log2(size as f32) as usize; // https://github.com/rust-lang/rust/issues/70887
     let mut slots = cells.chunks_exact_mut(slot_size);
 
     let mut leaves = Self::initialize_nodes(&mut *nodes, None);
