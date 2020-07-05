@@ -1,5 +1,6 @@
 #![feature(new_uninit)]
 #![feature(box_into_pin)]
+#![feature(slice_ptr_range)]
 #![feature(maybe_uninit_ref)]
 #![feature(maybe_uninit_extra)]
 #![feature(maybe_uninit_slice_assume_init)]

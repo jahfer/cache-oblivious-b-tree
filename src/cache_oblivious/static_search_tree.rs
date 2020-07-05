@@ -32,6 +32,17 @@ enum Marker<K, V> {
   DeleteCell(u16, K),
 }
 
+impl<K, V> Marker<K, V> {
+  fn version(&self) -> u16 {
+    match self {
+      Marker::Empty(v)
+      | Marker::Move(v, _, _)
+      | Marker::InsertCell(v, _, _)
+      | Marker::DeleteCell(v, _) => *v,
+    }
+  }
+}
+
 pub struct Cell<'a, K: 'a, V: 'a> {
   version: AtomicU16,
   marker: AtomicPtr<Marker<K, V>>,
@@ -101,7 +112,7 @@ impl<K: Eq + Ord + Debug, V: Debug> Debug for Block<'_, K, V> {
         "range",
         &format_args!("[{:?}..{:?}]", &self.min_key, &self.max_key),
       )
-      .field("cells", &format_args!("{:?}", self.cell_slice()))
+      // .field("cells", &format_args!("{:?}", self.cell_slice()))
       .finish()
   }
 }
@@ -203,7 +214,7 @@ impl<K: Eq + Ord + Debug, V: Debug> Debug for Node<'_, K, V> {
 
 pub struct StaticSearchTree<'a, K: Eq + Ord + 'a, V: 'a> {
   nodes: Box<[Node<'a, K, V>]>,
-  _cells: Box<[Cell<'a, K, V>]>,
+  cells: Box<[Cell<'a, K, V>]>,
 }
 
 impl<'a, K: Eq + Ord, V> StaticSearchTree<'a, K, V> {
@@ -221,15 +232,77 @@ impl<K: Eq + Ord + Debug, V: Debug> Debug for StaticSearchTree<'_, K, V> {
   }
 }
 
-impl<'a, K, V> StaticSearchTree<'a, K, V>
+impl<'a, K: 'a, V: 'a> StaticSearchTree<'a, K, V>
 where
-  K: Eq + Copy + Ord + std::fmt::Debug + 'a,
-  V: std::fmt::Debug + 'a,
+  K: Eq + Copy + Ord + std::fmt::Debug + Copy,
+  V: std::fmt::Debug + Copy,
 {
-  pub fn add(&mut self, key: K, _value: V) -> bool {
+  pub fn add(&mut self, key: K, value: V) -> bool {
     let block = self.root().locate_block_for_insertion(Key::Value(key));
-    println!("Found block for insertion: {:?}", block);
-    false
+
+    let mut current_cell_ptr = block.cells;
+
+    loop {
+      let cell = unsafe { &*current_cell_ptr };
+      let current_marker_raw = cell.marker.load(AtomicOrdering::SeqCst);
+      let marker = unsafe { &*current_marker_raw };
+      let version = cell.version.load(AtomicOrdering::SeqCst);
+
+      if version != marker.version() {
+        todo!("Read marker, perform action there");
+        // Hmm, do we even need version? This is the equivalent of a spinlock, which we don't want
+      }
+
+      let is_empty = unsafe { *cell.empty.get() };
+
+      // not empty, go to next cell
+      if !is_empty {
+        current_cell_ptr = unsafe { current_cell_ptr.add(1) };
+        if self.cells.as_ptr_range().contains(&current_cell_ptr) {
+          continue;
+        } else {
+          todo!("We've reached the end of the cell buffer, resize");
+        }
+      }
+
+      let marker_version = version + 1;
+
+      let new_marker = Box::new(Marker::InsertCell(marker_version, key, value));
+      let new_marker_raw = Box::into_raw(new_marker);
+      let prev_marker =
+        cell
+          .marker
+          .compare_and_swap(current_marker_raw, new_marker_raw, AtomicOrdering::SeqCst);
+
+      if prev_marker != current_marker_raw {
+        // Deallocate memory, try again next time
+        unsafe { Box::from_raw(prev_marker) };
+        // Marker has been updated by another process, start loop over
+        continue;
+      }
+
+      // We now have exclusive access to the cell until we update `version`.
+      // This works well for mutating through UnsafeCell<T>, but isn't really
+      // "lock-free"...
+      unsafe {
+        cell.key.get().write(Some(key));
+        cell.value.get().write(Some(value));
+        cell.empty.get().write(false);
+      };
+
+      let next_version = marker_version + 1;
+
+      // Reuse previous marker allocation
+      unsafe { prev_marker.write(Marker::Empty(next_version)) };
+      cell.marker.swap(prev_marker, AtomicOrdering::SeqCst);
+      cell.version.swap(next_version, AtomicOrdering::SeqCst);
+
+      break;
+    }
+
+    println!("Updated cells:\n{:?}", self.cells);
+
+    true
   }
 
   pub fn new(num_keys: u32) -> Self {
@@ -249,7 +322,7 @@ where
     let initialized_cells = unsafe { cells.assume_init() };
 
     StaticSearchTree {
-      _cells: initialized_cells,
+      cells: initialized_cells,
       nodes: initialized_nodes,
     }
   }
