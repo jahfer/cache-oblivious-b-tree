@@ -88,7 +88,7 @@ impl<K: Debug, V: Debug> Debug for Cell<'_, K, V> {
 pub struct Block<'a, K: Eq + Ord, V> {
   min_key: Key<K>,
   max_key: Key<K>,
-  cells: *const Cell<'a, K, V>,
+  cell_slice_ptr: *const Cell<'a, K, V>,
   length: usize,
   _marker: PhantomData<&'a [Cell<'a, K, V>]>,
 }
@@ -100,7 +100,7 @@ impl<K: Eq + Ord, V> Block<'_, K, V> {
   // }
 
   fn cell_slice(&self) -> &[Cell<K, V>] {
-    unsafe { slice::from_raw_parts(self.cells, self.length) }
+    unsafe { slice::from_raw_parts(self.cell_slice_ptr, self.length) }
   }
 }
 
@@ -240,7 +240,7 @@ where
   pub fn add(&mut self, key: K, value: V) -> bool {
     let block = self.root().locate_block_for_insertion(Key::Value(key));
 
-    let mut current_cell_ptr = block.cells;
+    let mut current_cell_ptr = block.cell_slice_ptr;
 
     loop {
       let cell = unsafe { &*current_cell_ptr };
@@ -447,7 +447,7 @@ where
         let block = Block {
           min_key: Key::Supremum,
           max_key: Key::Infimum,
-          cells: ptr,
+          cell_slice_ptr: ptr,
           length,
           _marker: PhantomData,
         };
