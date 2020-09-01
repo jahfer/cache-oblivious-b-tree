@@ -20,8 +20,10 @@ mod tests {
   #[test]
   fn test() {
     let mut tree = StaticSearchTree::<u8, &str>::new(30);
-    println!("{:?}", tree);
-    tree.add(5, "Hello!");
+    tree.add(6, "World!");
+    tree.add(5, "Hello");
+    // println!("{:#?}", tree);
+    tree.print_cells();
   }
 
   // #[test]

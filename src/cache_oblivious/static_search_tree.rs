@@ -7,7 +7,7 @@ use std::slice;
 use std::sync::atomic::{AtomicPtr, AtomicU16, Ordering as AtomicOrdering};
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Clone, Copy)]
-pub enum Key<T: Ord> {
+enum Key<T: Ord> {
   Infimum,
   Value(T),
   Supremum,
@@ -43,10 +43,9 @@ impl<K, V> Marker<K, V> {
   }
 }
 
-pub struct Cell<'a, K: 'a, V: 'a> {
+struct Cell<'a, K: 'a, V: 'a> {
   version: AtomicU16,
-  marker: AtomicPtr<Marker<K, V>>,
-  empty: UnsafeCell<bool>,
+  marker: Option<AtomicPtr<Marker<K, V>>>,
   key: UnsafeCell<Option<K>>,
   value: UnsafeCell<Option<V>>,
   _marker: PhantomData<&'a Marker<K, V>>,
@@ -54,40 +53,32 @@ pub struct Cell<'a, K: 'a, V: 'a> {
 
 impl<K, V> Drop for Cell<'_, K, V> {
   fn drop(&mut self) {
-    let marker = self.marker.load(AtomicOrdering::Acquire);
+    let ptr = self.marker.take().unwrap();
+    let marker = ptr.load(AtomicOrdering::Acquire);
     unsafe { Box::from_raw(marker) };
   }
 }
 
 impl<K: Debug, V: Debug> Debug for Cell<'_, K, V> {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     let version = self.version.load(AtomicOrdering::Acquire);
-    let marker = unsafe { &*self.marker.load(AtomicOrdering::Acquire) };
-    let empty = unsafe { *self.empty.get() };
+    let marker = unsafe { &*self.marker.as_ref().unwrap().load(AtomicOrdering::Acquire) };
     let key = unsafe { &*self.key.get() };
     let value = unsafe { &*self.value.get() };
 
-    let mut dbg_struct = f.debug_struct("Cell");
+    let mut dbg_struct = formatter.debug_struct("Cell");
 
     dbg_struct
       .field("version", &version)
       .field("marker", marker)
-      .field("empty", &empty);
-
-    if empty {
-      let none: Option<K> = Option::None;
-      dbg_struct.field("key", &none).field("value", &none);
-    } else {
-      dbg_struct.field("key", key).field("value", value);
-    }
+      .field("key", key)
+      .field("value", value);
 
     dbg_struct.finish()
   }
 }
 
-pub struct Block<'a, K: Eq + Ord, V> {
-  min_key: Key<K>,
-  max_key: Key<K>,
+struct Block<'a, K: Eq + Ord, V> {
   cell_slice_ptr: *const Cell<'a, K, V>,
   length: usize,
   _marker: PhantomData<&'a [Cell<'a, K, V>]>,
@@ -108,11 +99,7 @@ impl<K: Eq + Ord + Debug, V: Debug> Debug for Block<'_, K, V> {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     formatter
       .debug_struct("Block")
-      .field(
-        "range",
-        &format_args!("[{:?}..{:?}]", &self.min_key, &self.max_key),
-      )
-      // .field("cells", &format_args!("{:?}", self.cell_slice()))
+      .field("cells", &format_args!("{:?}", self.cell_slice()))
       .finish()
   }
 }
@@ -214,7 +201,8 @@ impl<K: Eq + Ord + Debug, V: Debug> Debug for Node<'_, K, V> {
 
 pub struct StaticSearchTree<'a, K: Eq + Ord + 'a, V: 'a> {
   nodes: Box<[Node<'a, K, V>]>,
-  cells: Box<[Cell<'a, K, V>]>,
+  cells: Box<[MaybeUninit<Cell<'a, K, V>>]>,
+  active_cells_ptr_range: std::ops::Range<*const Cell<'a, K, V>>,
 }
 
 impl<'a, K: Eq + Ord, V> StaticSearchTree<'a, K, V> {
@@ -244,7 +232,7 @@ where
 
     loop {
       let cell = unsafe { &*current_cell_ptr };
-      let current_marker_raw = cell.marker.load(AtomicOrdering::SeqCst);
+      let current_marker_raw = cell.marker.as_ref().unwrap().load(AtomicOrdering::SeqCst);
       let marker = unsafe { &*current_marker_raw };
       let version = cell.version.load(AtomicOrdering::SeqCst);
 
@@ -253,15 +241,15 @@ where
         // Hmm, do we even need version? This is the equivalent of a spinlock, which we don't want
       }
 
-      let is_empty = unsafe { *cell.empty.get() };
+      let is_filled_cell = unsafe { *cell.key.get() }.is_some();
 
       // not empty, go to next cell
-      if !is_empty {
+      if is_filled_cell {
         current_cell_ptr = unsafe { current_cell_ptr.add(1) };
-        if self.cells.as_ptr_range().contains(&current_cell_ptr) {
+        if self.active_cells_ptr_range.contains(&current_cell_ptr) {
           continue;
         } else {
-          todo!("We've reached the end of the cell buffer, resize");
+          todo!("We've reached the end of the initialized cell buffer, resize tree");
         }
       }
 
@@ -269,14 +257,15 @@ where
 
       let new_marker = Box::new(Marker::InsertCell(marker_version, key, value));
       let new_marker_raw = Box::into_raw(new_marker);
-      let prev_marker =
-        cell
-          .marker
-          .compare_and_swap(current_marker_raw, new_marker_raw, AtomicOrdering::SeqCst);
+      let prev_marker = cell.marker.as_ref().unwrap().compare_and_swap(
+        current_marker_raw,
+        new_marker_raw,
+        AtomicOrdering::SeqCst,
+      );
 
       if prev_marker != current_marker_raw {
         // Deallocate memory, try again next time
-        unsafe { Box::from_raw(prev_marker) };
+        unsafe { Box::from_raw(new_marker_raw) };
         // Marker has been updated by another process, start loop over
         continue;
       }
@@ -287,43 +276,64 @@ where
       unsafe {
         cell.key.get().write(Some(key));
         cell.value.get().write(Some(value));
-        cell.empty.get().write(false);
       };
 
       let next_version = marker_version + 1;
 
       // Reuse previous marker allocation
       unsafe { prev_marker.write(Marker::Empty(next_version)) };
-      cell.marker.swap(prev_marker, AtomicOrdering::SeqCst);
+      cell
+        .marker
+        .as_ref()
+        .unwrap()
+        .swap(prev_marker, AtomicOrdering::SeqCst);
       cell.version.swap(next_version, AtomicOrdering::SeqCst);
 
       break;
     }
 
-    println!("Updated cells:\n{:?}", self.cells);
-
     true
+  }
+
+  pub fn print_cells(&self) -> () {
+    let mut cell_ptr = unsafe { self.cells[0].get_ref() } as *const Cell<K, V>;
+    for i in 0..self.cells.len() {
+      if self.active_cells_ptr_range.contains(&cell_ptr) {
+        println!("[{}] {:?}", i, unsafe { &*cell_ptr });
+      } else {
+        println!("[{}] <(uninit)>", i);
+      }
+      unsafe { cell_ptr = cell_ptr.add(1) };
+    }
   }
 
   pub fn new(num_keys: u32) -> Self {
     let mut cells = Self::allocate_leaf_cells(num_keys);
     let mut nodes = Self::allocate_nodes(cells.len());
 
-    let size = cells.len();
-    let slot_size = f32::log2(size as f32) as usize; // https://github.com/rust-lang/rust/issues/70887
-    let mut slots = cells.chunks_exact_mut(slot_size);
-
     let mut leaves = Self::initialize_nodes(&mut *nodes, None);
+
+    let size = num_keys;
+    let slot_size = f32::log2(size as f32) as usize; // https://github.com/rust-lang/rust/issues/70887
+    let left_buffer_space = cells.len() >> 2;
+    let left_buffer_slots = left_buffer_space / slot_size;
+    let mut slots = cells.chunks_exact_mut(slot_size).skip(left_buffer_slots);
+
     for leaf in leaves.iter_mut() {
       Self::finalize_leaf_node(leaf, slots.next().unwrap());
     }
 
+    let active_cells_ptr_range = std::ops::Range {
+      start: unsafe { cells[left_buffer_space].get_ref() } as *const _,
+      end: unsafe { cells[cells.len() - left_buffer_space].get_ref() } as *const _,
+    };
+
     let initialized_nodes = unsafe { nodes.assume_init() };
-    let initialized_cells = unsafe { cells.assume_init() };
 
     StaticSearchTree {
-      cells: initialized_cells,
+      cells,
       nodes: initialized_nodes,
+      active_cells_ptr_range,
     }
   }
 
@@ -343,68 +353,63 @@ where
     Box::<[Node<K, V>]>::new_uninit_slice(node_count as usize)
   }
 
-  fn initialize_nodes<'b>(
+  fn assign_node_values<'b>(
     nodes: &'b mut [MaybeUninit<Node<'a, K, V>>],
     parent_node: Option<*mut *const Node<'a, K, V>>,
   ) -> Vec<&'b mut Node<'a, K, V>> {
     let num_nodes = nodes.len();
+    assert!(num_nodes <= 3);
 
-    if num_nodes == 1 {
-      nodes[0].write(Node::Branch {
+    for i in 0..num_nodes as usize {
+      nodes[i].write(Node::Branch {
         min_rhs: Key::Supremum,
         left: MaybeUninit::uninit(),
         right: MaybeUninit::uninit(),
         _marker: PhantomData,
       });
+    }
+
+    if num_nodes == 1 {
       return vec![];
     }
 
-    if num_nodes == 3 {
-      nodes[1].write(Node::Branch {
-        min_rhs: Key::Supremum,
-        left: MaybeUninit::uninit(),
-        right: MaybeUninit::uninit(),
-        _marker: PhantomData,
-      });
+    let left_node = unsafe { nodes[1].get_ref() } as *const _;
+    let right_node = unsafe { nodes[2].get_ref() } as *const _;
 
-      nodes[2].write(Node::Branch {
-        min_rhs: Key::Supremum,
-        left: MaybeUninit::uninit(),
-        right: MaybeUninit::uninit(),
-        _marker: PhantomData,
-      });
+    nodes[0].write(Node::Branch {
+      min_rhs: Key::Supremum,
+      left: MaybeUninit::new(left_node),
+      right: MaybeUninit::new(right_node),
+      _marker: PhantomData,
+    });
 
-      let left_node = unsafe { nodes[1].get_ref() } as *const _;
-      let right_node = unsafe { nodes[2].get_ref() } as *const _;
+    let (lhs, rhs) = nodes.split_at_mut(2);
 
-      nodes[0].write(Node::Branch {
-        min_rhs: Key::Supremum,
-        left: MaybeUninit::new(left_node),
-        right: MaybeUninit::new(right_node),
-        _marker: PhantomData,
-      });
+    if let Some(node) = parent_node {
+      unsafe { node.write(lhs[0].get_ref() as *const _) };
+    }
 
-      let (lhs, rhs) = nodes.split_at_mut(2);
+    let left_branch = unsafe { lhs[1].get_mut() };
+    let right_branch = unsafe { rhs[0].get_mut() };
 
-      if let Some(node) = parent_node {
-        unsafe { node.write(lhs[0].get_ref() as *const _) };
-      }
+    return vec![left_branch, right_branch];
+  }
 
-      let left_branch = unsafe { lhs[1].get_mut() };
-      let right_branch = unsafe { rhs[0].get_mut() };
-
-      return vec![left_branch, right_branch];
+  fn initialize_nodes<'b>(
+    nodes: &'b mut [MaybeUninit<Node<'a, K, V>>],
+    parent_node: Option<*mut *const Node<'a, K, V>>,
+  ) -> Vec<&'b mut Node<'a, K, V>> {
+    if nodes.len() <= 3 {
+      return Self::assign_node_values(nodes, parent_node);
     }
 
     let (upper_mem, lower_mem) = Self::split_tree_memory(nodes);
-    let upper_subtree_length = upper_mem.len() + 1;
+    let num_lower_branches = upper_mem.len() + 1;
 
     let leaves_of_upper = Self::initialize_nodes(upper_mem, parent_node);
 
-    let lower_branch_count = upper_subtree_length;
-    let cells_per_branch = lower_mem.len() / lower_branch_count;
-
-    let mut branches = lower_mem.chunks_exact_mut(cells_per_branch);
+    let nodes_per_branch = lower_mem.len() / num_lower_branches;
+    let mut branches = lower_mem.chunks_exact_mut(nodes_per_branch);
 
     leaves_of_upper
       .into_iter()
@@ -445,8 +450,6 @@ where
         let initialized_mem = Self::init_cell_block(leaf_mem);
         let ptr = initialized_mem as *const [Cell<K, V>] as *const Cell<K, V>;
         let block = Block {
-          min_key: Key::Supremum,
-          max_key: Key::Infimum,
           cell_slice_ptr: ptr,
           length,
           _marker: PhantomData,
@@ -462,10 +465,10 @@ where
   ) -> &'b mut [Cell<'a, K, V>] {
     for cell in cell_memory.iter_mut() {
       let marker = Box::new(Marker::<K, V>::Empty(1));
+      let ptr = Box::into_raw(marker);
       cell.write(Cell {
         version: AtomicU16::new(1),
-        marker: AtomicPtr::new(Box::into_raw(marker)),
-        empty: UnsafeCell::new(true),
+        marker: Some(AtomicPtr::new(ptr)),
         key: UnsafeCell::new(None),
         value: UnsafeCell::new(None),
         _marker: PhantomData,
