@@ -1,18 +1,21 @@
 # Cache-oblivious B-Tree Implementation
 
+Notes on this project begin at http://jahfer.com/posts/co-btree-0/
+
 ## Current Status:
 
 ```rust
-#[test]
-fn it_works() {
-    let mut map = CacheObliviousBTreeMap::new();
-    map.insert(5, "Hello");
-    map.insert(3, "World");
-    map.insert(2, "!");
+#[cfg(test)]
+mod tests {
+  use crate::StaticSearchTree;
 
-    assert_eq!(map.get(5), Some("Hello"));
-    assert_eq!(map.get(4), None);
-    assert_eq!(map.get(3), Some("World"));
-    assert_eq!(map.get(2), Some("!"));
+  #[test]
+  fn test() {
+    let mut tree = StaticSearchTree::<u8, &str>::new(30);
+    tree.add(6, "World!");
+    tree.add(5, "Hello");
+    assert_eq!(tree.find(5), Some("Hello"));
+    assert_eq!(tree.find(6), Some("World!"));
+  }
 }
 ```
