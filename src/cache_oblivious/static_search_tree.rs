@@ -9,6 +9,7 @@ use std::mem::MaybeUninit;
 use std::ops::{Range, RangeInclusive};
 use std::slice;
 use std::sync::atomic::{AtomicPtr, AtomicU16, Ordering as AtomicOrdering};
+use std::sync::RwLock;
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Clone, Copy)]
 enum Key<T: Ord> {
@@ -109,7 +110,7 @@ impl<K: Eq + Ord + Debug, V: Debug> Debug for Block<'_, K, V> {
 }
 
 enum Node<'a, K: Eq + Ord, V: Copy> {
-  Leaf(Key<K>, Block<'a, K, V>),
+  Leaf(RwLock<Key<K>>, Block<'a, K, V>),
   Branch {
     min_rhs: Key<K>,
     left: MaybeUninit<*const Node<'a, K, V>>,
@@ -118,10 +119,16 @@ enum Node<'a, K: Eq + Ord, V: Copy> {
   },
 }
 
-impl<K: Eq + Ord, V: Copy> Node<'_, K, V> {
-  fn search_to_block(&self, key: Key<K>) -> &Block<'_, K, V> {
+impl<K: Eq + Ord + Debug, V: Copy + Debug> Node<'_, K, V> {
+  fn search_to_block(&self, key: Key<K>, allow_empty: bool) -> Option<(&Block<'_, K, V>, &RwLock<Key<K>>)> {
     match self {
-      Node::Leaf(_, block) => block,
+      Node::Leaf(key, block) => {
+        if !allow_empty && *key.try_read().unwrap() == Key::Supremum {
+          None
+        } else {
+          Some((block, key))
+        }
+      },
       Node::Branch {
         min_rhs,
         left,
@@ -133,7 +140,7 @@ impl<K: Eq + Ord, V: Copy> Node<'_, K, V> {
         } else {
           unsafe { &**right.assume_init_ref() }
         };
-        node.search_to_block(key)
+        node.search_to_block(key, allow_empty)
       }
     }
   }
@@ -173,8 +180,8 @@ impl<K: Eq + Ord + Debug, V: Copy + Debug> Debug for Node<'_, K, V> {
       }
     } else {
       match self {
-        Self::Leaf(_, block) => {
-          formatter.write_fmt(format_args!("{}", format!("|- Leaf => {:?}", block)))
+        Self::Leaf(key, block) => {
+          formatter.write_fmt(format_args!("{}", format!("|- Leaf (min: {:?}) => {:?}", *key.try_read().unwrap(), block)))
         }
         Self::Branch {
           min_rhs,
@@ -297,7 +304,11 @@ where
   }
 
   pub fn find(&self, search_key: K) -> Option<V> {
-    let block = self.root().search_to_block(Key::Value(search_key));
+    let block = match self.root().search_to_block(Key::Value(search_key), false) {
+      Some((b, _)) => b,
+      None => return None
+    };
+
     let mut current_cell_ptr = block.cell_slice_ptr;
 
     loop {
@@ -324,8 +335,6 @@ where
       current_cell_ptr = unsafe { current_cell_ptr.add(1) };
       if self.active_cells_ptr_range.contains(&current_cell_ptr) {
         continue;
-      } else {
-        break;
       }
 
       break;
@@ -481,7 +490,12 @@ where
   }
 
   pub fn add(&mut self, key: K, value: V) -> bool {
-    let block = self.root().search_to_block(Key::Value(key));
+    let (block, node_key) = match self.root().search_to_block(Key::Value(key), true) {
+      Some(pair) => pair,
+      None => unreachable!()
+    };
+
+    let mut is_smallest_key = false;
 
     let mut current_cell_ptr = block.cell_slice_ptr;
     let mut selected_cell: Option<&Cell<K, V>> = None;
@@ -494,15 +508,18 @@ where
 
       if version != *marker.version() {
         todo!("Read marker, perform action there");
+        // continue
       }
 
       let cell_key = unsafe { *cell.key.get() };
 
+      // todo: if node_key is Supremum, skip this logic
+
       // cell is not empty
-      if let Some(k) = cell_key {
+      if let Some(existing_key) = cell_key {
         println!("Attempting to find slot for key {:?}", key);
-        println!("Filled cell has key {:?}", k);
-        if Key::Value(k) <= Key::Value(key) {
+        println!("Filled cell has key {:?}", existing_key);
+        if Key::Value(existing_key) <= Key::Value(key) {
           selected_cell = Some(cell);
 
           current_cell_ptr = unsafe { current_cell_ptr.add(1) };
@@ -513,10 +530,27 @@ where
           }
         } else if selected_cell.is_none() {
           // we didn't find any cells that were <= our key, rebalance to make room
+          is_smallest_key = true;
           self.rebalance(cell, true);
         }
+
+      // cell is empty
       } else {
-        selected_cell = None;
+
+        // node says there's a cell smaller than ours, keep looking
+        if selected_cell.is_none() && *node_key.try_read().unwrap() <= Key::Value(key) {
+          current_cell_ptr = unsafe { current_cell_ptr.add(1) };
+          if self.active_cells_ptr_range.contains(&current_cell_ptr) {
+            continue;
+          } else {
+            panic!("Found no filled cells but node indicated a key > {:?}", key);
+          }
+
+        // block is empty
+        } else {
+          is_smallest_key = true;
+          selected_cell = None;
+        }
       }
 
       if let Some(cell_to_move) = selected_cell {
@@ -566,6 +600,13 @@ where
         .unwrap()
         .swap(prev_marker.unwrap(), AtomicOrdering::SeqCst);
       cell.version.swap(next_version, AtomicOrdering::SeqCst);
+
+      if dbg!(is_smallest_key) {
+        let mut k = node_key.write().unwrap();
+        *k = Key::Value(key);
+      }
+
+      println!("{:?}", self);
 
       println!("INSERT SUCCESS: {:?}", cell);
 
@@ -704,7 +745,7 @@ where
           length,
           _marker: PhantomData,
         };
-        *leaf = Node::Leaf(*min_rhs, block);
+        *leaf = Node::Leaf(RwLock::new(*min_rhs), block);
       }
       Node::Leaf(_, _) => (),
     };
