@@ -3,11 +3,12 @@ use std::cell::UnsafeCell;
 use std::cmp::{Ord, Ordering};
 use std::collections::VecDeque;
 use std::convert::TryInto;
-use std::fmt::{self, Debug};
+use std::fmt::{self, Debug, Display};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ops::{Range, RangeInclusive};
 use std::slice;
+use std::error::Error;
 use std::sync::atomic::{AtomicPtr, AtomicU16, Ordering as AtomicOrdering};
 use std::sync::RwLock;
 
@@ -29,15 +30,15 @@ impl<T: Ord> Ord for Key<T> {
   }
 }
 
-#[derive(Debug)]
-enum Marker<K, V> {
+#[derive(Debug, Copy, Clone)]
+enum Marker<K: Clone, V: Clone> {
   Empty(u16),
   Move(u16, isize),
   InsertCell(u16, K, V),
   DeleteCell(u16, K),
 }
 
-impl<K, V> Marker<K, V> {
+impl<K: Clone, V: Clone> Marker<K, V> {
   fn version(&self) -> &u16 {
     match self {
       Marker::Empty(v)
@@ -48,7 +49,7 @@ impl<K, V> Marker<K, V> {
   }
 }
 
-struct Cell<'a, K: 'a, V: 'a> {
+struct Cell<'a, K: 'a + Clone, V: 'a + Clone> {
   version: AtomicU16,
   marker: Option<AtomicPtr<Marker<K, V>>>,
   key: UnsafeCell<Option<K>>,
@@ -56,7 +57,7 @@ struct Cell<'a, K: 'a, V: 'a> {
   _marker: PhantomData<&'a Marker<K, V>>,
 }
 
-impl<K, V> Drop for Cell<'_, K, V> {
+impl<K: Clone, V: Clone> Drop for Cell<'_, K, V> {
   fn drop(&mut self) {
     let ptr = self.marker.take().unwrap();
     let marker = ptr.load(AtomicOrdering::Acquire);
@@ -64,7 +65,7 @@ impl<K, V> Drop for Cell<'_, K, V> {
   }
 }
 
-impl<K: Debug, V: Debug> Debug for Cell<'_, K, V> {
+impl<K: Debug + Clone, V: Debug + Clone> Debug for Cell<'_, K, V> {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     let version = self.version.load(AtomicOrdering::Acquire);
     let marker = unsafe { &*self.marker.as_ref().unwrap().load(AtomicOrdering::Acquire) };
@@ -83,24 +84,148 @@ impl<K: Debug, V: Debug> Debug for Cell<'_, K, V> {
   }
 }
 
-struct Block<'a, K: Eq + Ord, V> {
+#[derive(Debug, Copy, Clone)]
+struct CellData<K: Clone, V: Clone> {
+  key: K,
+  value: V,
+  marker: Marker<K, V>,
+}
+
+struct CellGuard<'a, K: 'a + Clone, V: 'a + Clone> {
+  inner: &'a Cell<'a, K, V>,
+  cache_version: u16,
+  cache_data: Option<CellData<K, V>>,
+  cache_marker_ptr: *mut Marker<K, V>,
+  _phantom: PhantomData<&'a Cell<'a, K, V>>
+}
+
+impl <K: Clone, V: Clone> CellGuard<'_, K, V> {
+  fn is_empty(&self) -> bool {
+    self.cache_data.is_none()
+  }
+
+  fn update(&mut self, marker: Marker<K, V>) -> Result<*mut Marker<K,V>, Box<dyn Error>> {
+    let boxed_marker = Box::new(marker);
+    let new_marker_raw = Box::into_raw(boxed_marker);
+    let result = self.inner.marker.as_ref().unwrap().compare_exchange(
+      self.cache_marker_ptr,
+      new_marker_raw,
+      AtomicOrdering::SeqCst,
+      AtomicOrdering::SeqCst,
+    );
+
+    if result.is_err() {
+      // Deallocate memory, try again next time
+      unsafe { Box::from_raw(new_marker_raw) };
+      // Marker has been updated by another process, start loop over
+      return Err(Box::new(CellWriteError {}))
+    } else {
+      let old_marker_box = self.cache_marker_ptr;
+      self.cache_marker_ptr = new_marker_raw;
+      Ok(old_marker_box)
+    }
+
+  }
+}
+
+#[derive(Debug)]
+struct CellReadError;
+#[derive(Debug)]
+struct CellWriteError;
+
+impl Display for CellReadError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      write!(f, "CellReadError - Unable to read cell!")
+  }
+}
+
+impl Display for CellWriteError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      write!(f, "CellWriteError - Unable to write cell!")
+  }
+}
+
+impl Error for CellReadError {}
+impl Error for CellWriteError {}
+
+impl <'a, K: Clone, V: Clone> CellGuard<'a, K, V> {
+  unsafe fn from_raw(ptr: *const Cell<'a, K, V>) -> Result<CellGuard<'a, K, V>, Box<dyn Error>> {
+    let cell = &*ptr;
+    let version = cell.version.load(AtomicOrdering::SeqCst);
+    let current_marker_raw = cell.marker.as_ref().unwrap().load(AtomicOrdering::SeqCst);
+    let marker = (*current_marker_raw).clone();
+
+    if version != *marker.version() {
+      return Result::Err(Box::new(CellReadError {}));
+      todo!("Read marker, perform action there, reload data");
+    }
+
+    let key = (*cell.key.get()).clone();
+
+    let cache = if key.is_some() {
+      let value = (*cell.value.get()).clone();
+      Some(CellData { key: key.unwrap(), value: value.unwrap(), marker })
+    } else {
+      None
+    };
+
+    Ok(CellGuard {
+      inner: cell,
+      cache_version: version,
+      cache_marker_ptr: current_marker_raw,
+      cache_data: cache,
+      _phantom: PhantomData
+    })
+  }
+}
+
+struct CellIterator<'a, K: Ord + Clone, V: Clone> {
+  count: usize,
+  address: *const Cell<'a, K, V>,
+  end_address: *const Cell<'a, K, V>
+}
+
+impl <'a, K: Clone + Ord, V: Clone> CellIterator<'a, K, V> {
+  fn new(ptr: *const Cell<'a, K, V>, last_cell_address: *const Cell<'a, K, V>) -> CellIterator<'a, K, V> {
+    CellIterator {
+      count: 0,
+      address: ptr,
+      end_address: last_cell_address
+    }
+  }
+}
+
+impl <'a, K: Ord + Clone, V: Clone> Iterator for CellIterator<'a, K, V> {
+  type Item = CellGuard<'a, K, V>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    if self.count > 0 {
+      self.address = unsafe { self.address.add(1) };
+      if self.address > self.end_address {
+        return None;
+      }
+    }
+
+    self.count += 1;
+
+    let guard = unsafe { CellGuard::from_raw(self.address) }.unwrap();
+    Some(guard)
+  }
+}
+
+struct Block<'a, K: Eq + Ord + Clone, V: Clone> {
   cell_slice_ptr: *const Cell<'a, K, V>,
   length: usize,
   _marker: PhantomData<&'a [Cell<'a, K, V>]>,
 }
 
-impl<K: Eq + Ord, V> Block<'_, K, V> {
-  // pub fn get(&self, _key: K) -> (&AtomicU16, &Option<V>) {
-  //   let cell = &self.cell_slice()[0];
-  //   (&cell.version, unsafe { &*cell.value.get() })
-  // }
-
+impl<K: Eq + Ord + Clone, V: Clone> Block<'_, K, V> {
   fn cell_slice(&self) -> &[Cell<K, V>] {
     unsafe { slice::from_raw_parts(self.cell_slice_ptr, self.length) }
   }
 }
 
-impl<K: Eq + Ord + Debug, V: Debug> Debug for Block<'_, K, V> {
+impl<K: Eq + Ord + Debug + Clone, V: Debug + Clone> Debug for Block<'_, K, V> {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     formatter
       .debug_struct("Block")
@@ -109,7 +234,7 @@ impl<K: Eq + Ord + Debug, V: Debug> Debug for Block<'_, K, V> {
   }
 }
 
-enum Node<'a, K: Eq + Ord, V: Copy> {
+enum Node<'a, K: Eq + Ord + Clone, V: Copy> {
   Leaf(RwLock<Key<K>>, Block<'a, K, V>),
   Branch {
     min_rhs: Key<K>,
@@ -119,7 +244,7 @@ enum Node<'a, K: Eq + Ord, V: Copy> {
   },
 }
 
-impl<K: Eq + Ord + Debug, V: Copy + Debug> Node<'_, K, V> {
+impl<K: Eq + Ord + Debug + Clone, V: Copy + Debug> Node<'_, K, V> {
   fn search_to_block(&self, key: Key<K>, allow_empty: bool) -> Option<(&Block<'_, K, V>, &RwLock<Key<K>>)> {
     match self {
       Node::Leaf(key, block) => {
@@ -146,7 +271,7 @@ impl<K: Eq + Ord + Debug, V: Copy + Debug> Node<'_, K, V> {
   }
 }
 
-impl<K: Eq + Ord + Debug, V: Copy + Debug> Debug for Node<'_, K, V> {
+impl<K: Eq + Ord + Debug + Clone, V: Copy + Debug> Debug for Node<'_, K, V> {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     if formatter.alternate() {
       match self {
@@ -221,20 +346,20 @@ struct Config {
   density_scale: Vec<Density>,
 }
 
-pub struct StaticSearchTree<'a, K: Eq + Ord + 'a, V: Copy + 'a> {
+pub struct StaticSearchTree<'a, K: Eq + Ord + Clone + 'a, V: Copy + 'a> {
   nodes: Box<[Node<'a, K, V>]>,
   cells: Box<[MaybeUninit<Cell<'a, K, V>>]>,
   active_cells_ptr_range: Range<*const Cell<'a, K, V>>,
   config: Config,
 }
 
-impl<'a, K: Eq + Ord, V: Copy> StaticSearchTree<'a, K, V> {
+impl<'a, K: Eq + Ord + Clone, V: Copy> StaticSearchTree<'a, K, V> {
   fn root(&'a self) -> &Node<'a, K, V> {
     &self.nodes[0]
   }
 }
 
-impl<K: Eq + Ord + Debug, V: Copy + Debug> Debug for StaticSearchTree<'_, K, V> {
+impl<K: Eq + Ord + Debug + Clone, V: Copy + Debug> Debug for StaticSearchTree<'_, K, V> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match f.alternate() {
       true => f.write_fmt(format_args!("{:#?}", self.root())),
@@ -309,58 +434,34 @@ where
       None => return None
     };
 
-    let mut current_cell_ptr = block.cell_slice_ptr;
+    let iter = CellIterator::new(block.cell_slice_ptr, self.active_cells_ptr_range.end);
 
-    loop {
-      let cell = unsafe { &*current_cell_ptr };
-      let version = cell.version.load(AtomicOrdering::SeqCst);
-      let current_marker_raw = cell.marker.as_ref().unwrap().load(AtomicOrdering::SeqCst);
-      let marker = unsafe { &*current_marker_raw };
-
-      if version != *marker.version() {
-        todo!("Read marker, perform action there");
-      }
-
-      let key: &Option<K> = unsafe { &*cell.key.get() };
-      let is_filled_cell = key.is_some();
-
-      if is_filled_cell {
-        if key.unwrap() == search_key {
-          return unsafe { *cell.value.get() };
-        } else if key.unwrap() > search_key {
+    for cell_guard in iter {
+      if !cell_guard.is_empty() {
+        let cache = cell_guard.cache_data.unwrap();
+        if cache.key == search_key {
+          return Some(cache.value);
+        } else if cache.key > search_key {
           return None;
         }
       }
-
-      current_cell_ptr = unsafe { current_cell_ptr.add(1) };
-      if self.active_cells_ptr_range.contains(&current_cell_ptr) {
-        continue;
-      }
-
-      break;
     }
 
     None
   }
 
   fn rebalance(&self, cell_ptr_start: *const Cell<K, V>, for_insertion: bool) {
-    println!("Rebalancing...");
     let mut count = 1;
-    let mut current_cell_ptr = cell_ptr_start;
     let mut cells_to_move: VecDeque<*const Cell<K, V>> = VecDeque::new();
+    let mut current_cell_ptr = cell_ptr_start;
 
-    loop {
-      let cell_idx =
-        unsafe { current_cell_ptr.offset_from(self.cells[0].assume_init_ref() as *const Cell<K, V>) };
-      println!("Current global cell index {:?}", cell_idx);
+    let iter = CellIterator::new(cell_ptr_start, self.active_cells_ptr_range.end);
 
-      let cell = unsafe { &*current_cell_ptr };
-      let cell_key = unsafe { *cell.key.get() };
-      if cell_key.is_some() {
-        cells_to_move.push_front(cell);
-        println!("Adding to queue: {:?}", cell);
-      } else {
-        println!("Empty cell...");
+    for cell_guard in iter {
+      current_cell_ptr = cell_guard.inner;
+
+      if !cell_guard.is_empty() {
+        cells_to_move.push_front(cell_guard.inner);
       }
 
       let numer = if for_insertion {
@@ -369,20 +470,16 @@ where
         cells_to_move.len()
       };
 
-      let current_density = Rational::new(numer.try_into().unwrap(), count.try_into().unwrap());
+      let current_density = Rational::new(
+        numer.try_into().unwrap(), 
+        count.try_into().unwrap()
+      );
 
       if self.within_density_threshold(count, current_density) {
-        println!("FOUND WINDOW [_; {}] TO FIT DENSITY THRESHOLD", count);
         break;
       }
 
-      current_cell_ptr = unsafe { current_cell_ptr.add(1) };
-      if self.active_cells_ptr_range.contains(&current_cell_ptr) {
-        count += 1;
-        continue;
-      } else {
-        todo!("We've reached the end of the initialized cell buffer, resize tree");
-      }
+      count += 1;
     }
 
     // There are different strategies available for rebalancing
@@ -495,120 +592,77 @@ where
       None => unreachable!()
     };
 
+    let iter = CellIterator::new(block.cell_slice_ptr, self.active_cells_ptr_range.end);
+
+    let mut selected_cell: Option<CellGuard<K, V>> = None;
     let mut is_smallest_key = false;
 
-    let mut current_cell_ptr = block.cell_slice_ptr;
-    let mut selected_cell: Option<&Cell<K, V>> = None;
-
-    loop {
-      let cell = unsafe { &*current_cell_ptr };
-      let version = cell.version.load(AtomicOrdering::SeqCst);
-      let current_marker_raw = cell.marker.as_ref().unwrap().load(AtomicOrdering::SeqCst);
-      let marker = unsafe { &*current_marker_raw };
-
-      if version != *marker.version() {
-        todo!("Read marker, perform action there");
-        // continue
-      }
-
-      let cell_key = unsafe { *cell.key.get() };
-
-      // todo: if node_key is Supremum, skip this logic
-
-      // cell is not empty
-      if let Some(existing_key) = cell_key {
-        println!("Attempting to find slot for key {:?}", key);
-        println!("Filled cell has key {:?}", existing_key);
-        if Key::Value(existing_key) <= Key::Value(key) {
-          selected_cell = Some(cell);
-
-          current_cell_ptr = unsafe { current_cell_ptr.add(1) };
-          if self.active_cells_ptr_range.contains(&current_cell_ptr) {
-            continue;
-          } else {
-            todo!("We've reached the end of the initialized cell buffer, resize tree");
-          }
-        } else if selected_cell.is_none() {
-          // we didn't find any cells that were <= our key, rebalance to make room
-          is_smallest_key = true;
-          self.rebalance(cell, true);
-        }
-
-      // cell is empty
-      } else {
-
+    for mut cell_guard in iter {
+      if cell_guard.is_empty() {
         // node says there's a cell smaller than ours, keep looking
         if selected_cell.is_none() && *node_key.try_read().unwrap() <= Key::Value(key) {
-          current_cell_ptr = unsafe { current_cell_ptr.add(1) };
-          if self.active_cells_ptr_range.contains(&current_cell_ptr) {
-            continue;
-          } else {
-            panic!("Found no filled cells but node indicated a key > {:?}", key);
-          }
-
+          continue;
         // block is empty
         } else {
           is_smallest_key = true;
           selected_cell = None;
         }
+      } else {
+        let cache = cell_guard.cache_data.unwrap();
+        println!("Attempting to find slot for key {:?}", key);
+        println!("Filled cell has key {:?}", cache.key);
+        if Key::Value(cache.key) <= Key::Value(key) {
+          selected_cell = Some(cell_guard);
+          continue
+        } else if selected_cell.is_none() {
+          // we didn't find any cells that were <= our key, rebalance to make room
+          is_smallest_key = true;
+          self.rebalance(cell_guard.inner as *const _, true);
+        }
       }
 
-      if let Some(cell_to_move) = selected_cell {
+      if let Some(cell_to_move) = &selected_cell {
         // move cell to make room for insert
-        self.rebalance(cell_to_move, true);
+        self.rebalance(cell_to_move.inner, true);
       }
 
-      let marker_version = version + 1;
+      let marker_version = cell_guard.cache_version + 1;
+      let cell = selected_cell.as_mut().unwrap_or(&mut cell_guard);
+      let marker = Marker::InsertCell(marker_version, key, value);
 
-      let cell = selected_cell.unwrap_or(cell);
-
-      let new_marker = Box::new(Marker::InsertCell(
-        marker_version,
-        key,
-        value,
-      ));
-      let new_marker_raw = Box::into_raw(new_marker);
-      let prev_marker = cell.marker.as_ref().unwrap().compare_exchange(
-        current_marker_raw,
-        new_marker_raw,
-        AtomicOrdering::SeqCst,
-        AtomicOrdering::SeqCst,
-      );
-
-      if prev_marker.is_err() {
-        // Deallocate memory, try again next time
-        unsafe { Box::from_raw(new_marker_raw) };
+      let result = cell.update(marker);
+      
+      if result.is_err() {
         // Marker has been updated by another process, start loop over
-        continue;
+        continue
       }
+
+      let prev_marker = result.unwrap();
 
       // We now have exclusive access to the cell until we update `version`.
       // This works well for mutating through UnsafeCell<T>, but isn't really
       // "lock-free"...
       unsafe {
-        cell.key.get().write(Some(key));
-        cell.value.get().write(Some(value));
+        cell.inner.key.get().write(Some(key));
+        cell.inner.value.get().write(Some(value));
       };
 
       let next_version = marker_version + 1;
 
       // Reuse previous marker allocation
-      unsafe { prev_marker.unwrap().write(Marker::Empty(next_version)) };
+      unsafe { prev_marker.write(Marker::Empty(next_version)) };
       cell
+        .inner
         .marker
         .as_ref()
         .unwrap()
-        .swap(prev_marker.unwrap(), AtomicOrdering::SeqCst);
-      cell.version.swap(next_version, AtomicOrdering::SeqCst);
+        .swap(prev_marker, AtomicOrdering::SeqCst);
+      cell.inner.version.swap(next_version, AtomicOrdering::SeqCst);
 
-      if dbg!(is_smallest_key) {
+      if is_smallest_key {
         let mut k = node_key.write().unwrap();
         *k = Key::Value(key);
       }
-
-      println!("{:?}", self);
-
-      println!("INSERT SUCCESS: {:?}", cell);
 
       break;
     }
