@@ -13,3 +13,12 @@ criterion = "0.3"
 [[bench]]
 name = "my_benchmark"
 harness = false
+
+[profile.release]
+debug = true
+
+[[bin]]
+name = "manual_benchmark"
+path = "src/manual_benchmark.rs"
+test = false
+bench = false
