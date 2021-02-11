@@ -409,11 +409,11 @@ where
         }
       } else {
         let cache = cell_guard.cache_data.unwrap();
-        println!("Attempting to find slot for key {:?}", key);
-        println!("Filled cell has key {:?}", cache.key);
-        if Key::Value(cache.key) <= Key::Value(key) {
+        if Key::Value(cache.key) < Key::Value(key) {
           selected_cell = Some(cell_guard);
           continue
+        } else if Key::Value(cache.key) == Key::Value(key) {
+          selected_cell = None;
         } else if selected_cell.is_none() {
           // we didn't find any cells that were <= our key, rebalance to make room
           is_smallest_key = true;

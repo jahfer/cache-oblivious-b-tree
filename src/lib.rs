@@ -4,7 +4,6 @@
 #![feature(maybe_uninit_slice)]
 #![feature(option_insert)]
 
-
 mod cache_oblivious;
 pub use cache_oblivious::StaticSearchTree;
 
@@ -16,6 +15,13 @@ mod tests {
   fn find_missing() {
     let tree = StaticSearchTree::<u8, &str>::new(3);
     assert_eq!(tree.find(4), None);
+  }
+
+  #[test]
+  fn add_existing() {
+    let mut tree = StaticSearchTree::<u8, &str>::new(3);
+    tree.add(5, "Test");
+    tree.add(5, "Double");
   }
 
   #[test]
