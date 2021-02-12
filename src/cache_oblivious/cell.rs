@@ -47,7 +47,19 @@ pub struct Cell<'a, K: 'a + Clone, V: 'a + Clone> {
   pub marker: Option<AtomicPtr<Marker<K, V>>>,
   pub key: UnsafeCell<Option<K>>,
   pub value: UnsafeCell<Option<V>>,
-  pub _marker: PhantomData<&'a Marker<K, V>>,
+  _marker: PhantomData<&'a Marker<K, V>>,
+}
+
+impl <'a, K: Clone, V: Clone> Cell<'a, K, V> {
+  pub fn new(version: u16, marker_ptr: *mut Marker<K, V>) -> Cell<'a, K, V> {
+    Cell {
+      version: AtomicU16::new(version),
+      marker: Some(AtomicPtr::new(marker_ptr)),
+      key: UnsafeCell::new(None),
+      value: UnsafeCell::new(None),
+      _marker: PhantomData,
+    }
+  }
 }
 
 impl<K: Clone, V: Clone> Drop for Cell<'_, K, V> {

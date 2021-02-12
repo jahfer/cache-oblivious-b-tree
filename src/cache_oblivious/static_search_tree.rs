@@ -611,13 +611,7 @@ where
     for cell in cell_memory.iter_mut() {
       let marker = Box::new(Marker::<K, V>::Empty(1));
       let ptr = Box::into_raw(marker);
-      cell.write(Cell {
-        version: AtomicU16::new(1),
-        marker: Some(AtomicPtr::new(ptr)),
-        key: UnsafeCell::new(None),
-        value: UnsafeCell::new(None),
-        _marker: PhantomData,
-      });
+      cell.write(Cell::new(1, ptr));
     }
     unsafe { MaybeUninit::slice_assume_init_mut(cell_memory) }
   }
