@@ -1,5 +1,4 @@
 use num_rational::{Ratio, Rational};
-use std::cell::UnsafeCell;
 use std::cmp::{Ord};
 use std::collections::VecDeque;
 use std::convert::TryInto;
@@ -8,7 +7,7 @@ use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ops::{Range, RangeInclusive};
 use std::slice;
-use std::sync::atomic::{AtomicPtr, AtomicU16, Ordering as AtomicOrdering};
+use std::sync::atomic::Ordering;
 use std::sync::RwLock;
 
 use super::cell::{Key, Cell, CellGuard, CellIterator, Marker};
@@ -36,7 +35,7 @@ impl<K: Eq + Ord + Debug + Clone, V: Debug + Clone> Debug for Block<'_, K, V> {
 
 enum Node<'a, K: Eq + Ord + Clone, V: Copy> {
   Leaf(RwLock<Key<K>>, Block<'a, K, V>),
-  Branch {
+  Internal {
     min_rhs: Key<K>,
     left: MaybeUninit<*const Node<'a, K, V>>,
     right: MaybeUninit<*const Node<'a, K, V>>,
@@ -44,30 +43,51 @@ enum Node<'a, K: Eq + Ord + Clone, V: Copy> {
   },
 }
 
-impl<K: Eq + Ord + Debug + Clone, V: Copy + Debug> Node<'_, K, V> {
-  fn search_to_block(&self, key: Key<K>, allow_empty: bool) -> Option<(&Block<'_, K, V>, &RwLock<Key<K>>)> {
+enum SearchResult<'a, K: Clone + Ord, V: Copy> {
+  Block(&'a Block<'a, K, V>, &'a RwLock<Key<K>>),
+  Internal(&'a Node<'a, K, V>),
+  NotFound
+} 
+
+impl<'a, K: Eq + Ord + Debug + Clone, V: Copy + Debug> Node<'a, K, V> {
+  fn search(&'a self, key: &Key<K>, allow_empty: bool) -> SearchResult<'a, K, V> {
     match self {
-      Node::Leaf(key, block) => {
-        if !allow_empty && *key.try_read().unwrap() == Key::Supremum {
-          None
+      Node::Leaf(key_lock, block) => {
+        if !allow_empty && *key_lock.try_read().unwrap() == Key::Supremum {
+          SearchResult::NotFound
         } else {
-          Some((block, key))
+          SearchResult::Block(block, key_lock)
         }
       },
-      Node::Branch {
+      Node::Internal {
         min_rhs,
         left,
         right,
         ..
       } => {
-        let node = if &key < min_rhs {
+        let node = if key < min_rhs {
           unsafe { &**left.assume_init_ref() }
         } else {
           unsafe { &**right.assume_init_ref() }
         };
-        node.search_to_block(key, allow_empty)
+        SearchResult::Internal(node)
       }
     }
+  }
+
+  fn search_to_block(&self, key: &Key<K>, allow_empty: bool) -> Option<(&Block<'_, K, V>, &RwLock<Key<K>>)> {
+    let mut result = None;
+    let mut node = self;
+
+    while let None = result {
+      match node.search(key, allow_empty) {
+        SearchResult::NotFound => result = Some(None),
+        SearchResult::Block(b, k) => result = Some(Some((b,k))),
+        SearchResult::Internal(next_node) => node = next_node
+      }
+    }
+
+    result.unwrap()
   }
 }
 
@@ -79,13 +99,13 @@ impl<K: Eq + Ord + Debug + Clone, V: Copy + Debug> Debug for Node<'_, K, V> {
           "{}",
           format!("|- Leaf => {:?} @ {:p}", block, self)
         )),
-        Self::Branch {
+        Self::Internal {
           min_rhs,
           left,
           right,
           ..
         } => formatter.write_fmt(format_args!(
-          "|- Branch {{ min_rhs: {:?} }} @ {:p}\n{:ident$}{}\n{:ident$}{}",
+          "|- Internal {{ min_rhs: {:?} }} @ {:p}\n{:ident$}{}\n{:ident$}{}",
           min_rhs,
           self,
           "|",
@@ -108,13 +128,13 @@ impl<K: Eq + Ord + Debug + Clone, V: Copy + Debug> Debug for Node<'_, K, V> {
         Self::Leaf(key, block) => {
           formatter.write_fmt(format_args!("{}", format!("|- Leaf (min: {:?}) => {:?}", *key.try_read().unwrap(), block)))
         }
-        Self::Branch {
+        Self::Internal {
           min_rhs,
           left,
           right,
           ..
         } => formatter.write_fmt(format_args!(
-          "|- Branch {{ min_rhs: {:?} }}\n{:ident$}{}\n{:ident$}{}",
+          "|- Internal {{ min_rhs: {:?} }}\n{:ident$}{}\n{:ident$}{}",
           min_rhs,
           "|",
           format!(
@@ -229,7 +249,7 @@ where
   }
 
   pub fn find(&self, search_key: K) -> Option<V> {
-    let block = match self.root().search_to_block(Key::Value(search_key), false) {
+    let block = match self.root().search_to_block(&Key::Value(search_key), false) {
       Some((b, _)) => b,
       None => return None
     };
@@ -238,7 +258,7 @@ where
 
     for cell_guard in iter {
       if !cell_guard.is_empty() {
-        let cache = cell_guard.cache_data.unwrap();
+        let cache = cell_guard.cache().unwrap().unwrap();
         if cache.key == search_key {
           return Some(cache.value);
         } else if cache.key > search_key {
@@ -305,12 +325,12 @@ where
       }
 
       let cell_to_move = unsafe { &**cell_ptr };
-      let version = cell_to_move.version.load(AtomicOrdering::SeqCst);
+      let version = cell_to_move.version.load(Ordering::SeqCst);
       let current_marker_raw = cell_to_move
         .marker
         .as_ref()
         .unwrap()
-        .load(AtomicOrdering::SeqCst);
+        .load(Ordering::SeqCst);
       let marker = unsafe { &*current_marker_raw };
       let marker_version = *marker.version();
 
@@ -328,8 +348,8 @@ where
       let prev_marker = cell_to_move.marker.as_ref().unwrap().compare_exchange(
         current_marker_raw,
         new_marker_raw,
-        AtomicOrdering::SeqCst,
-        AtomicOrdering::SeqCst,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
       );
 
       if prev_marker.is_err() {
@@ -340,8 +360,12 @@ where
       }
 
       unsafe {
-        current_cell_ptr.as_ref().unwrap().key.get().write(*cell_to_move.key.get());
-        current_cell_ptr.as_ref().unwrap().value.get().write(*cell_to_move.value.get());
+        // update new cell
+        cell.key.get().write(*cell_to_move.key.get());
+        cell.value.get().write(*cell_to_move.value.get());
+        // todo update version and marker of new cell?
+
+        // update old cell
         cell_to_move.key.get().write(None);
         cell_to_move.value.get().write(None);
         let new_version = version + 1;
@@ -351,14 +375,14 @@ where
         let _ = cell_to_move.marker.as_ref().unwrap().compare_exchange_weak(
           new_marker_raw,
           prev_marker.unwrap(),
-          AtomicOrdering::SeqCst,
-          AtomicOrdering::SeqCst,
+          Ordering::SeqCst,
+          Ordering::SeqCst,
         );
         let _ = cell_to_move.version.compare_exchange_weak(
           marker_version,
           new_version,
-          AtomicOrdering::SeqCst,
-          AtomicOrdering::SeqCst
+          Ordering::SeqCst,
+          Ordering::SeqCst
         );
         // TODO: increment version, clear marker
       };
@@ -387,7 +411,7 @@ where
   }
 
   pub fn add(&mut self, key: K, value: V) -> bool {
-    let (block, node_key) = match self.root().search_to_block(Key::Value(key), true) {
+    let (block, node_key) = match self.root().search_to_block(&Key::Value(key), true) {
       Some(pair) => pair,
       None => unreachable!()
     };
@@ -408,7 +432,7 @@ where
           selected_cell = None;
         }
       } else {
-        let cache = cell_guard.cache_data.unwrap();
+        let cache = cell_guard.cache().unwrap().unwrap();
         if Key::Value(cache.key) < Key::Value(key) {
           selected_cell = Some(cell_guard);
           continue
@@ -456,8 +480,8 @@ where
         .marker
         .as_ref()
         .unwrap()
-        .swap(prev_marker, AtomicOrdering::SeqCst);
-      cell.inner.version.swap(next_version, AtomicOrdering::SeqCst);
+        .swap(prev_marker, Ordering::SeqCst);
+      cell.inner.version.swap(next_version, Ordering::SeqCst);
 
       if is_smallest_key {
         let mut k = node_key.write().unwrap();
@@ -484,7 +508,6 @@ where
 
   fn allocate_leaf_cells(num_keys: u32) -> Box<[MaybeUninit<Cell<'a, K, V>>]> {
     let size = Self::values_mem_size(num_keys);
-    println!("packed memory array [V; {:?}]", size);
     Box::<[Cell<K, V>]>::new_uninit_slice(size as usize)
   }
 
@@ -494,7 +517,6 @@ where
     let slot_size = f32::log2(size as f32) as usize;
     let leaf_count = size / slot_size;
     let node_count = 2 * leaf_count - 1;
-    println!("tree has {:?} leaves, {:?} nodes", leaf_count, node_count);
     Box::<[Node<K, V>]>::new_uninit_slice(node_count as usize)
   }
 
@@ -506,7 +528,7 @@ where
     assert!(num_nodes <= 3);
 
     for i in 0..num_nodes as usize {
-      nodes[i].write(Node::Branch {
+      nodes[i].write(Node::Internal {
         min_rhs: Key::Supremum,
         left: MaybeUninit::uninit(),
         right: MaybeUninit::uninit(),
@@ -521,7 +543,7 @@ where
     let left_node = unsafe { nodes[1].assume_init_ref() } as *const _;
     let right_node = unsafe { nodes[2].assume_init_ref() } as *const _;
 
-    nodes[0].write(Node::Branch {
+    nodes[0].write(Node::Internal {
       min_rhs: Key::Supremum,
       left: MaybeUninit::new(left_node),
       right: MaybeUninit::new(right_node),
@@ -560,7 +582,7 @@ where
       .into_iter()
       .flat_map(|subtree_leaf| match subtree_leaf {
         Node::Leaf(_, _) => unreachable!(),
-        Node::Branch { left, right, .. } => {
+        Node::Internal { left, right, .. } => {
           let lhs_mem = branches.next().unwrap();
           let rhs_mem = branches.next().unwrap();
           let lhs = Self::initialize_nodes(lhs_mem, Some(left.as_mut_ptr()));
@@ -590,7 +612,7 @@ where
     leaf_mem: &'b mut [MaybeUninit<Cell<'a, K, V>>],
   ) -> () {
     match leaf {
-      Node::Branch { min_rhs, .. } => {
+      Node::Internal { min_rhs, .. } => {
         let length = leaf_mem.len();
         let initialized_mem = Self::init_cell_block(leaf_mem);
         let ptr = initialized_mem as *const [Cell<K, V>] as *const Cell<K, V>;
@@ -611,7 +633,7 @@ where
     for cell in cell_memory.iter_mut() {
       let marker = Box::new(Marker::<K, V>::Empty(1));
       let ptr = Box::into_raw(marker);
-      cell.write(Cell::new(1, ptr));
+      cell.write(Cell::new(ptr));
     }
     unsafe { MaybeUninit::slice_assume_init_mut(cell_memory) }
   }

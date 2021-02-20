@@ -3,6 +3,7 @@
 #![feature(maybe_uninit_extra)]
 #![feature(maybe_uninit_slice)]
 #![feature(option_insert)]
+#![feature(once_cell)]
 
 mod cache_oblivious;
 pub use cache_oblivious::StaticSearchTree;

@@ -4,6 +4,7 @@ use std::fmt::{self, Debug, Display};
 use std::marker::PhantomData;
 use std::error::Error;
 use std::sync::atomic::{AtomicPtr, AtomicU16, Ordering as AtomicOrdering};
+use std::lazy::OnceCell;
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Clone, Copy)]
 pub enum Key<T: Ord> {
@@ -51,9 +52,9 @@ pub struct Cell<'a, K: 'a + Clone, V: 'a + Clone> {
 }
 
 impl <'a, K: Clone, V: Clone> Cell<'a, K, V> {
-  pub fn new(version: u16, marker_ptr: *mut Marker<K, V>) -> Cell<'a, K, V> {
+  pub fn new(marker_ptr: *mut Marker<K, V>) -> Cell<'a, K, V> {
     Cell {
-      version: AtomicU16::new(version),
+      version: AtomicU16::new(1),
       marker: Some(AtomicPtr::new(marker_ptr)),
       key: UnsafeCell::new(None),
       value: UnsafeCell::new(None),
@@ -99,14 +100,41 @@ pub struct CellData<K: Clone, V: Clone> {
 pub struct CellGuard<'a, K: 'a + Clone, V: 'a + Clone> {
   pub inner: &'a Cell<'a, K, V>,
   pub cache_version: u16,
-  pub cache_data: Option<CellData<K, V>>,
+  pub is_filled: bool,
+  cache_data: OnceCell<Option<CellData<K, V>>>,
   cache_marker_ptr: *mut Marker<K, V>,
   _phantom: PhantomData<&'a Cell<'a, K, V>>
 }
 
 impl <K: Clone, V: Clone> CellGuard<'_, K, V> {
   pub fn is_empty(&self) -> bool {
-    self.cache_data.is_none()
+    !self.is_filled
+  }
+
+  pub fn cache(&self) -> Result<&Option<CellData<K, V>>, CellReadError> {
+    self.cache_data.get_or_try_init(|| {
+      let version = self.inner.version.load(AtomicOrdering::SeqCst);
+      let key = unsafe { (*self.inner.key.get()).clone() };
+
+      let value = if key.is_some() {
+        unsafe { (*self.inner.value.get()).clone() }
+      } else {
+        None
+      };
+      let current_marker_raw = self.inner.marker.as_ref().unwrap().load(AtomicOrdering::SeqCst);
+      let marker = unsafe { (*current_marker_raw).clone() };
+
+      if version != *marker.version() {
+        return Result::Err(CellReadError {});
+        // todo!("Read marker, perform action there, reload data");
+      }
+      
+      if key.is_some() {
+        Ok(Some(CellData { key: key.unwrap(), value: value.unwrap(), marker }))
+      } else {
+        Ok(None)
+      }
+    })
   }
 
   pub fn update(&mut self, marker: Marker<K, V>) -> Result<*mut Marker<K,V>, Box<dyn Error>> {
@@ -134,9 +162,9 @@ impl <K: Clone, V: Clone> CellGuard<'_, K, V> {
 }
 
 #[derive(Debug)]
-struct CellReadError;
+pub struct CellReadError;
 #[derive(Debug)]
-struct CellWriteError;
+pub struct CellWriteError;
 
 impl Display for CellReadError {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -157,28 +185,15 @@ impl <'a, K: Clone, V: Clone> CellGuard<'a, K, V> {
   unsafe fn from_raw(ptr: *const Cell<'a, K, V>) -> Result<CellGuard<'a, K, V>, Box<dyn Error>> {
     let cell = &*ptr;
     let version = cell.version.load(AtomicOrdering::SeqCst);
-    let current_marker_raw = cell.marker.as_ref().unwrap().load(AtomicOrdering::SeqCst);
-    let marker = (*current_marker_raw).clone();
-
-    if version != *marker.version() {
-      return Result::Err(Box::new(CellReadError {}));
-      todo!("Read marker, perform action there, reload data");
-    }
-
     let key = (*cell.key.get()).clone();
-
-    let cache = if key.is_some() {
-      let value = (*cell.value.get()).clone();
-      Some(CellData { key: key.unwrap(), value: value.unwrap(), marker })
-    } else {
-      None
-    };
+    let current_marker_raw = cell.marker.as_ref().unwrap().load(AtomicOrdering::SeqCst);
 
     Ok(CellGuard {
       inner: cell,
+      is_filled: key.is_some(),
       cache_version: version,
       cache_marker_ptr: current_marker_raw,
-      cache_data: cache,
+      cache_data: OnceCell::new(),
       _phantom: PhantomData
     })
   }
