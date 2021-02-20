@@ -9,9 +9,10 @@ num-rational = "0.3"
 
 [dev-dependencies]
 criterion = "0.3"
+cargo-criterion = "1.0.0"
 
 [[bench]]
-name = "my_benchmark"
+name = "bench_main"
 harness = false
 
 [profile.release]
