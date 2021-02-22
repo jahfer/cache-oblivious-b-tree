@@ -50,4 +50,14 @@ mod tests {
     assert_eq!(tree.find(3), Some("World"));
     assert_eq!(tree.find(2), Some("!"));
   }
+
+  #[test]
+  fn add_100_values() {
+    let mut tree = StaticSearchTree::<u8, u8>::new(100);
+    for i in 1..100u8 {
+      tree.add(i, i+1);
+    }
+
+    assert_eq!(tree.find(99), Some(100));
+  }
 }

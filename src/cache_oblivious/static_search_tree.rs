@@ -416,6 +416,8 @@ where
       None => unreachable!()
     };
 
+    let block_key = *node_key.read().unwrap();
+
     let iter = CellIterator::new(block.cell_slice_ptr, self.active_cells_ptr_range.end);
 
     let mut selected_cell: Option<CellGuard<K, V>> = None;
@@ -424,7 +426,7 @@ where
     for mut cell_guard in iter {
       if cell_guard.is_empty() {
         // node says there's a cell smaller than ours, keep looking
-        if selected_cell.is_none() && *node_key.try_read().unwrap() <= Key::Value(key) {
+        if selected_cell.is_none() && block_key <= Key::Value(key) {
           continue;
         // block is empty
         } else {
@@ -508,6 +510,7 @@ where
 
   fn allocate_leaf_cells(num_keys: u32) -> Box<[MaybeUninit<Cell<'a, K, V>>]> {
     let size = Self::values_mem_size(num_keys);
+    println!("packed memory array [V; {:?}]", size);
     Box::<[Cell<K, V>]>::new_uninit_slice(size as usize)
   }
 
@@ -517,6 +520,7 @@ where
     let slot_size = f32::log2(size as f32) as usize;
     let leaf_count = size / slot_size;
     let node_count = 2 * leaf_count - 1;
+    println!("tree has {:?} leaves, {:?} nodes", leaf_count, node_count);
     Box::<[Node<K, V>]>::new_uninit_slice(node_count as usize)
   }
 
@@ -537,7 +541,8 @@ where
     }
 
     if num_nodes == 1 {
-      return vec![];
+      let node = unsafe { nodes[0].assume_init_mut() };
+      return vec![node];
     }
 
     let left_node = unsafe { nodes[1].assume_init_ref() } as *const _;
