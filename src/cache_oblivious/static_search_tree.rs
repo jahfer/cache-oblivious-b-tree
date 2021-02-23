@@ -342,7 +342,7 @@ where
         unsafe { current_cell_ptr.offset_from(self.cells[0].assume_init_ref() as *const Cell<K, V>) };
       let new_marker = Box::new(Marker::Move(marker_version, dest_index));
 
-      println!("Writing marker {:?}", new_marker);
+      // println!("Writing marker {:?}", new_marker);
 
       let new_marker_raw = Box::into_raw(new_marker);
       let prev_marker = cell_to_move.marker.as_ref().unwrap().compare_exchange(
@@ -510,7 +510,7 @@ where
 
   fn allocate_leaf_cells(num_keys: u32) -> Box<[MaybeUninit<Cell<'a, K, V>>]> {
     let size = Self::values_mem_size(num_keys);
-    println!("packed memory array [V; {:?}]", size);
+    // println!("packed memory array [V; {:?}]", size);
     Box::<[Cell<K, V>]>::new_uninit_slice(size as usize)
   }
 
@@ -520,7 +520,7 @@ where
     let slot_size = f32::log2(size as f32) as usize;
     let leaf_count = size / slot_size;
     let node_count = 2 * leaf_count - 1;
-    println!("tree has {:?} leaves, {:?} nodes", leaf_count, node_count);
+    // println!("tree has {:?} leaves, {:?} nodes", leaf_count, node_count);
     Box::<[Node<K, V>]>::new_uninit_slice(node_count as usize)
   }
 
