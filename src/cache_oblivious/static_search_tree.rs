@@ -5,10 +5,12 @@ use std::convert::TryInto;
 use std::fmt::{self, Debug};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::ops::{Range, RangeInclusive};
+use std::ops::RangeInclusive;
 use std::slice;
 use std::sync::atomic::Ordering;
 use std::sync::RwLock;
+
+use super::packed_memory_array::PackedMemoryArray;
 
 use super::cell::{Key, Cell, CellGuard, CellIterator, Marker};
 
@@ -168,8 +170,7 @@ struct Config {
 
 pub struct StaticSearchTree<'a, K: Eq + Ord + Clone + 'a, V: Copy + 'a> {
   nodes: Box<[Node<'a, K, V>]>,
-  cells: Box<[MaybeUninit<Cell<'a, K, V>>]>,
-  active_cells_ptr_range: Range<*const Cell<'a, K, V>>,
+  cells: PackedMemoryArray<Cell<'a, K, V>>,
   config: Config,
 }
 
@@ -194,25 +195,16 @@ where
   V: std::fmt::Debug + Copy,
 {
   pub fn new(num_keys: u32) -> Self {
-    let mut cells = Self::allocate_leaf_cells(num_keys);
+    let cells = PackedMemoryArray::with_capacity(num_keys);
     let mut nodes = Self::allocate_nodes(cells.len());
 
     let mut leaves = Self::initialize_nodes(&mut *nodes, None);
-
-    let size = num_keys;
-    let slot_size = f32::log2(size as f32) as usize; // https://github.com/rust-lang/rust/issues/70887
-    let left_buffer_space = cells.len() >> 2;
-    let left_buffer_slots = left_buffer_space / slot_size;
-    let mut slots = cells.chunks_exact_mut(slot_size).skip(left_buffer_slots);
+    let slot_size = f32::log2(num_keys as f32) as usize; // https://github.com/rust-lang/rust/issues/70887
+    let mut slots = cells.as_slice().chunks_exact(slot_size);
 
     for leaf in leaves.iter_mut() {
       Self::finalize_leaf_node(leaf, slots.next().unwrap());
     }
-
-    let active_cells_ptr_range = std::ops::Range {
-      start: unsafe { cells[left_buffer_space].assume_init_ref() } as *const _,
-      end: unsafe { cells[cells.len() - left_buffer_space].assume_init_ref() } as *const _,
-    };
 
     let initialized_nodes = unsafe { nodes.assume_init() };
 
@@ -243,7 +235,6 @@ where
     StaticSearchTree {
       cells,
       nodes: initialized_nodes,
-      active_cells_ptr_range,
       config: Config { density_scale },
     }
   }
@@ -254,7 +245,7 @@ where
       None => return None
     };
 
-    let iter = CellIterator::new(block.cell_slice_ptr, self.active_cells_ptr_range.end);
+    let iter = CellIterator::new(block.cell_slice_ptr, self.cells.active_range.end);
 
     for cell_guard in iter {
       if !cell_guard.is_empty() {
@@ -275,7 +266,7 @@ where
     let mut cells_to_move: VecDeque<*const Cell<K, V>> = VecDeque::new();
     let mut current_cell_ptr = cell_ptr_start;
 
-    let iter = CellIterator::new(cell_ptr_start, self.active_cells_ptr_range.end);
+    let iter = CellIterator::new(cell_ptr_start, self.cells.active_range.end);
 
     for cell_guard in iter {
       current_cell_ptr = cell_guard.inner;
@@ -339,7 +330,7 @@ where
       }
 
       let dest_index =
-        unsafe { current_cell_ptr.offset_from(self.cells[0].assume_init_ref() as *const Cell<K, V>) };
+        unsafe { current_cell_ptr.offset_from(self.cells.into_iter().next().unwrap() as *const Cell<K, V>) };
       let new_marker = Box::new(Marker::Move(marker_version, dest_index));
 
       // println!("Writing marker {:?}", new_marker);
@@ -389,7 +380,7 @@ where
 
 
       current_cell_ptr = unsafe { current_cell_ptr.sub(1) };
-      if self.active_cells_ptr_range.contains(&current_cell_ptr) {
+      if self.cells.active_range.contains(&current_cell_ptr) {
         continue;
       } else {
         unreachable!("We've reached the end of the initialized cell buffer!");
@@ -418,7 +409,7 @@ where
 
     let block_key = *node_key.read().unwrap();
 
-    let iter = CellIterator::new(block.cell_slice_ptr, self.active_cells_ptr_range.end);
+    let iter = CellIterator::new(block.cell_slice_ptr, self.cells.active_range.end);
 
     let mut selected_cell: Option<CellGuard<K, V>> = None;
     let mut is_smallest_key = false;
@@ -497,21 +488,15 @@ where
   }
 
   pub fn print_cells(&self) -> () {
-    let mut cell_ptr = unsafe { self.cells[0].assume_init_ref() } as *const Cell<K, V>;
+    let mut cell_ptr = self.cells.into_iter().next().unwrap() as *const Cell<K, V>;
     for i in 0..self.cells.len() {
-      if self.active_cells_ptr_range.contains(&cell_ptr) {
+      if self.cells.active_range.contains(&cell_ptr) {
         println!("[{}] {:?}", i, unsafe { &*cell_ptr });
       } else {
         println!("[{}] <(uninit)>", i);
       }
       unsafe { cell_ptr = cell_ptr.add(1) };
     }
-  }
-
-  fn allocate_leaf_cells(num_keys: u32) -> Box<[MaybeUninit<Cell<'a, K, V>>]> {
-    let size = Self::values_mem_size(num_keys);
-    // println!("packed memory array [V; {:?}]", size);
-    Box::<[Cell<K, V>]>::new_uninit_slice(size as usize)
   }
 
   fn allocate_nodes(leaf_count: usize) -> Box<[MaybeUninit<Node<'a, K, V>>]> {
@@ -614,13 +599,12 @@ where
 
   fn finalize_leaf_node<'b>(
     leaf: &'b mut Node<'a, K, V>,
-    leaf_mem: &'b mut [MaybeUninit<Cell<'a, K, V>>],
+    leaf_mem: &'b [Cell<'a, K, V>],
   ) -> () {
     match leaf {
       Node::Internal { min_rhs, .. } => {
         let length = leaf_mem.len();
-        let initialized_mem = Self::init_cell_block(leaf_mem);
-        let ptr = initialized_mem as *const [Cell<K, V>] as *const Cell<K, V>;
+        let ptr = leaf_mem as *const [Cell<K, V>] as *const Cell<K, V>;
         let block = Block {
           cell_slice_ptr: ptr,
           length,
@@ -630,28 +614,5 @@ where
       }
       Node::Leaf(_, _) => (),
     };
-  }
-
-  fn init_cell_block<'b>(
-    cell_memory: &'b mut [MaybeUninit<Cell<'a, K, V>>],
-  ) -> &'b mut [Cell<'a, K, V>] {
-    for cell in cell_memory.iter_mut() {
-      let marker = Box::new(Marker::<K, V>::Empty(1));
-      let ptr = Box::into_raw(marker);
-      cell.write(Cell::new(ptr));
-    }
-    unsafe { MaybeUninit::slice_assume_init_mut(cell_memory) }
-  }
-
-  fn values_mem_size(num_keys: u32) -> u32 {
-    let t_min = 0.5;
-    let p_max = 0.25;
-    let ideal_density = (t_min - p_max) / 2f32;
-
-    let length = num_keys as f32 / ideal_density;
-    // To get a balanced tree, we need to find the
-    // closest double-exponential number (x = 2^2^i)
-    let clean_length = 2 << ((f32::log2(length).ceil() as u32).next_power_of_two() - 1);
-    clean_length
   }
 }

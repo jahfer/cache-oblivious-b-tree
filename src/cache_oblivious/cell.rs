@@ -63,6 +63,14 @@ impl <'a, K: Clone, V: Clone> Cell<'a, K, V> {
   }
 }
 
+impl<K, V> Default for Cell<'_, K, V> where K: Clone, V: Clone {
+  fn default() -> Self {
+    let marker = Box::new(Marker::<K, V>::Empty(1));
+    let ptr = Box::into_raw(marker);
+    Cell::new(ptr)
+  }
+}
+
 impl<K: Clone, V: Clone> Drop for Cell<'_, K, V> {
   fn drop(&mut self) {
     let ptr = self.marker.take().unwrap();
