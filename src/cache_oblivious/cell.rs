@@ -134,7 +134,7 @@ impl <K: Clone, V: Clone> CellGuard<'_, K, V> {
 
       if version != *marker.version() {
         return Result::Err(CellReadError {});
-        // todo!("Read marker, perform action there, reload data");
+        // todo "Read marker, perform action there, reload data"
       }
       
       if key.is_some() {
@@ -195,6 +195,8 @@ impl <'a, K: Clone, V: Clone> CellGuard<'a, K, V> {
     let version = cell.version.load(AtomicOrdering::SeqCst);
     let key = (*cell.key.get()).clone();
     let current_marker_raw = cell.marker.as_ref().unwrap().load(AtomicOrdering::SeqCst);
+
+    // TODO: Check version in marker to make sure the cell was not modified in between
 
     Ok(CellGuard {
       inner: cell,

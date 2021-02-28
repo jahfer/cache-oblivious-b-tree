@@ -378,7 +378,6 @@ where
         // TODO: increment version, clear marker
       };
 
-
       current_cell_ptr = unsafe { current_cell_ptr.sub(1) };
       if self.cells.active_range.contains(&current_cell_ptr) {
         continue;
