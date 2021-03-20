@@ -13,6 +13,37 @@ pub enum Key<T: Ord> {
   Supremum,
 }
 
+impl <'a, T: Ord> Key<T> {
+  pub fn as_ref(&self) -> Key<&T> {
+    match *self {
+      Key::Value(ref v) => Key::Value(v),
+      Key::Infimum => Key::Infimum,
+      Key::Supremum => Key::Supremum
+    }
+  }
+
+  pub fn unwrap(self) -> T {
+    match self {
+      Key::Value(val) => val,
+      _ => panic!("Called Key::unwrap() on an infinite value")
+    }
+  }
+
+  pub fn is_infimum(&self) -> bool {
+    match self {
+      Key::Infimum => true,
+      _ => false
+    }
+  }
+
+  pub fn is_supremum(&self) -> bool {
+    match self {
+      Key::Supremum => true,
+      _ => false
+    }
+  }
+}
+
 impl<T: Ord> Ord for Key<T> {
   fn cmp(&self, other: &Self) -> Ordering {
     match (self, other) {
@@ -21,6 +52,12 @@ impl<T: Ord> Ord for Key<T> {
       (Key::Supremum, _) | (_, Key::Infimum) => Ordering::Greater,
       (Key::Value(a), Key::Value(b)) => a.cmp(b),
     }
+  }
+}
+
+impl <'a, T: Ord> From<&'a Key<T>> for Key<&'a T> {
+  fn from(k: &'a Key<T>) -> Key<&'a T> {
+    k.as_ref()
   }
 }
 
@@ -43,27 +80,25 @@ impl<K: Clone, V: Clone> Marker<K, V> {
   }
 }
 
-pub struct Cell<'a, K: 'a + Clone, V: 'a + Clone> {
+pub struct Cell<K: Clone, V: Clone> {
   pub version: AtomicU16,
   pub marker: Option<AtomicPtr<Marker<K, V>>>,
   pub key: UnsafeCell<Option<K>>,
   pub value: UnsafeCell<Option<V>>,
-  _marker: PhantomData<&'a Marker<K, V>>,
 }
 
-impl <'a, K: Clone, V: Clone> Cell<'a, K, V> {
-  pub fn new(marker_ptr: *mut Marker<K, V>) -> Cell<'a, K, V> {
+impl <K: Clone, V: Clone> Cell<K, V> {
+  pub fn new(marker_ptr: *mut Marker<K, V>) -> Cell<K, V> {
     Cell {
       version: AtomicU16::new(1),
       marker: Some(AtomicPtr::new(marker_ptr)),
       key: UnsafeCell::new(None),
       value: UnsafeCell::new(None),
-      _marker: PhantomData,
     }
   }
 }
 
-impl<K, V> Default for Cell<'_, K, V> where K: Clone, V: Clone {
+impl<K, V> Default for Cell<K, V> where K: Clone, V: Clone {
   fn default() -> Self {
     let marker = Box::new(Marker::<K, V>::Empty(1));
     let ptr = Box::into_raw(marker);
@@ -71,7 +106,7 @@ impl<K, V> Default for Cell<'_, K, V> where K: Clone, V: Clone {
   }
 }
 
-impl<K: Clone, V: Clone> Drop for Cell<'_, K, V> {
+impl<K: Clone, V: Clone> Drop for Cell<K, V> {
   fn drop(&mut self) {
     let ptr = self.marker.take().unwrap();
     let marker = ptr.load(AtomicOrdering::Acquire);
@@ -79,7 +114,7 @@ impl<K: Clone, V: Clone> Drop for Cell<'_, K, V> {
   }
 }
 
-impl<K: Debug + Clone, V: Debug + Clone> Debug for Cell<'_, K, V> {
+impl<K: Debug + Clone, V: Debug + Clone> Debug for Cell<K, V> {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     let version = self.version.load(AtomicOrdering::Acquire);
     let marker = unsafe { &*self.marker.as_ref().unwrap().load(AtomicOrdering::Acquire) };
@@ -106,12 +141,12 @@ pub struct CellData<K: Clone, V: Clone> {
 }
 
 pub struct CellGuard<'a, K: 'a + Clone, V: 'a + Clone> {
-  pub inner: &'a Cell<'a, K, V>,
+  pub inner: &'a Cell<K, V>,
   pub cache_version: u16,
   pub is_filled: bool,
   cache_data: OnceCell<Option<CellData<K, V>>>,
   cache_marker_ptr: *mut Marker<K, V>,
-  _phantom: PhantomData<&'a Cell<'a, K, V>>
+  _phantom: PhantomData<&'a Cell<K, V>>
 }
 
 impl <K: Clone, V: Clone> CellGuard<'_, K, V> {
@@ -165,7 +200,6 @@ impl <K: Clone, V: Clone> CellGuard<'_, K, V> {
       self.cache_marker_ptr = new_marker_raw;
       Ok(old_marker_box)
     }
-
   }
 }
 
@@ -190,7 +224,7 @@ impl Error for CellReadError {}
 impl Error for CellWriteError {}
 
 impl <'a, K: Clone, V: Clone> CellGuard<'a, K, V> {
-  unsafe fn from_raw(ptr: *const Cell<'a, K, V>) -> Result<CellGuard<'a, K, V>, Box<dyn Error>> {
+  pub unsafe fn from_raw(ptr: *const Cell<K, V>) -> Result<CellGuard<'a, K, V>, Box<dyn Error>> {
     let cell = &*ptr;
     let version = cell.version.load(AtomicOrdering::SeqCst);
     let key = (*cell.key.get()).clone();
@@ -211,16 +245,18 @@ impl <'a, K: Clone, V: Clone> CellGuard<'a, K, V> {
 
 pub struct CellIterator<'a, K: Ord + Clone, V: Clone> {
   count: usize,
-  address: *const Cell<'a, K, V>,
-  end_address: *const Cell<'a, K, V>
+  address: *const Cell<K, V>,
+  end_address: *const Cell<K, V>,
+  _phantom: PhantomData<&'a Cell<K,V>>
 }
 
 impl <'a, K: Clone + Ord, V: Clone> CellIterator<'a, K, V> {
-  pub fn new(ptr: *const Cell<'a, K, V>, last_cell_address: *const Cell<'a, K, V>) -> CellIterator<'a, K, V> {
+  pub fn new(ptr: *const Cell<K, V>, last_cell_address: *const Cell<K, V>) -> CellIterator<'a, K, V> {
     CellIterator {
       count: 0,
       address: ptr,
-      end_address: last_cell_address
+      end_address: last_cell_address,
+      _phantom: PhantomData
     }
   }
 }

@@ -2,6 +2,6 @@
 // mod packed_data;
 mod cell;
 mod packed_memory_array;
-mod static_search_tree;
+mod btree_map;
 
-pub use static_search_tree::StaticSearchTree;
+pub use btree_map::BTreeMap;

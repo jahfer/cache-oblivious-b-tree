@@ -1,15 +1,15 @@
-use cache_oblivious_b_tree::StaticSearchTree;
+use cache_oblivious_b_tree::BTreeMap;
 
 fn main() {
-  let mut tree = StaticSearchTree::<u8, &str>::new(16);
+  let mut tree = BTreeMap::new(16);
 
   for _ in 1..10_000_000 {
-    tree.add(5, "Hello");
-    tree.add(3, "World");
-    tree.add(2, "!");
+    tree.insert(5, "Hello");
+    tree.insert(3, "World");
+    tree.insert(2, "!");
 
-    tree.find(5);
-    tree.find(3);
-    tree.find(2);
+    tree.get(&5);
+    tree.get(&3);
+    tree.get(&2);
   }
 }

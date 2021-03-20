@@ -4,60 +4,60 @@
 #![feature(maybe_uninit_slice)]
 #![feature(option_insert)]
 #![feature(once_cell)]
+#![feature(box_into_pin)]
 
 mod cache_oblivious;
-pub use cache_oblivious::StaticSearchTree;
+pub use cache_oblivious::BTreeMap;
 
 #[cfg(test)]
 mod tests {
-  use crate::StaticSearchTree;
+  use crate::BTreeMap;
 
   #[test]
   fn find_missing() {
-    let tree = StaticSearchTree::<u8, &str>::new(3);
-    assert_eq!(tree.find(4), None);
+    let tree = BTreeMap::<u8, String>::new(3);
+    assert_eq!(tree.get(&4), None);
   }
 
   #[test]
   fn add_existing() {
-    let mut tree = StaticSearchTree::<u8, &str>::new(3);
-    tree.add(5, "Test");
-    tree.add(5, "Double");
+    let mut tree = BTreeMap::<u8, String>::new(3);
+    tree.insert(5, String::from("Test"));
+    tree.insert(5, String::from("Double"));
   }
 
   #[test]
   fn add_ordered_values() {
-    let mut tree = StaticSearchTree::<u8, &str>::new(3);
-
-    tree.add(3, "Hello");
-    tree.add(8, "World");
-    tree.add(12, "!");
-
-    assert_eq!(tree.find(3), Some("Hello"));
-    assert_eq!(tree.find(8), Some("World"));
-    assert_eq!(tree.find(12), Some("!"));
+    let mut tree = BTreeMap::<u8, String>::new(3);
+    tree.insert(3, String::from("Hello"));
+    tree.insert(8, String::from("World"));
+    tree.insert(12, String::from("!"));
+  
+    assert_eq!(tree.get(&3), Some(&String::from("Hello")));
+    assert_eq!(tree.get(&8), Some(&String::from("World")));
+    assert_eq!(tree.get(&12), Some(&String::from("!")));
   }
 
   #[test]
   fn add_unordered_values() {
-    let mut tree = StaticSearchTree::<u8, &str>::new(16);
-    tree.add(5, "Hello");
-    tree.add(3, "World");
-    tree.add(2, "!");
+    let mut tree = BTreeMap::<u8, String>::new(16);
+    tree.insert(5, String::from("Hello"));
+    tree.insert(3, String::from("World"));
+    tree.insert(2, String::from("!"));
 
-    assert_eq!(tree.find(5), Some("Hello"));
-    assert_eq!(tree.find(4), None);
-    assert_eq!(tree.find(3), Some("World"));
-    assert_eq!(tree.find(2), Some("!"));
+    assert_eq!(tree.get(&5), Some(&String::from("Hello")));
+    assert_eq!(tree.get(&4), None);
+    assert_eq!(tree.get(&3), Some(&String::from("World")));
+    assert_eq!(tree.get(&2), Some(&String::from("!")));
   }
 
   #[test]
   fn add_100_values() {
-    let mut tree = StaticSearchTree::<u8, u8>::new(100);
+    let mut tree = BTreeMap::<u8, u8>::new(100);
     for i in 1..100u8 {
-      tree.add(i, i+1);
+      tree.insert(i, i+1);
     }
-
-    assert_eq!(tree.find(99), Some(100));
+  
+    assert_eq!(tree.get(&99), Some(&100));
   }
 }
