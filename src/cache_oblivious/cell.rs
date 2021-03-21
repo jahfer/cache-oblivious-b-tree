@@ -87,6 +87,9 @@ pub struct Cell<K: Clone, V: Clone> {
   pub value: UnsafeCell<Option<V>>,
 }
 
+unsafe impl <K: Clone, V: Clone> Send for Cell<K,V> {}
+unsafe impl <K: Clone, V: Clone> Sync for Cell<K,V> {}
+
 impl <K: Clone, V: Clone> Cell<K, V> {
   pub fn new(marker_ptr: *mut Marker<K, V>) -> Cell<K, V> {
     Cell {

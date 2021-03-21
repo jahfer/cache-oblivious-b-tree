@@ -13,6 +13,9 @@ pub struct PackedMemoryArray<T> {
   _pin: PhantomPinned
 }
 
+unsafe impl <T> Send for PackedMemoryArray<T> {}
+unsafe impl <T> Sync for PackedMemoryArray<T> {}
+
 impl <T> PackedMemoryArray<T> {
   pub fn new(cells: Box<[T]>, capacity: u32) -> PackedMemoryArray<T> {
     let left_buffer_space = cells.len() >> 2;

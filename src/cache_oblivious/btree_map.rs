@@ -1,40 +1,64 @@
-use std::borrow::Borrow;
+use std::{borrow::Borrow, thread::Thread};
 use std::fmt::{self, Debug};
-use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::sync::atomic::Ordering;
 use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::ptr::NonNull;
+use std::cell::UnsafeCell;
+use std::sync::{Arc, RwLock};
+use std::sync::mpsc::{Receiver, Sender, channel, TryRecvError};
+
+use threadpool::ThreadPool;
 
 use num_rational::{Ratio, Rational};
 
 use super::packed_memory_array::PackedMemoryArray;
 use super::cell::{Cell, Key, CellIterator, CellGuard, Marker};
 
-pub struct BTreeMap<'a, K: Copy + Ord, V: Clone> {
-  data: PackedMemoryArray<Cell<K,V>>,
-  index: BlockIndex<'a, K, V>
+pub struct BTreeMap<K: Copy + Ord, V: Clone> {
+  data: Arc<PackedMemoryArray<Cell<K,V>>>,
+  index: Arc<RwLock<BlockIndex<K, V>>>,
+  tx: Sender<BlockIndex<K, V>>,
+  rx: Receiver<BlockIndex<K, V>>,
+  pool: ThreadPool
 }
 
-impl <'a, K, V> BTreeMap<'a, K, V> where K: Copy + Ord, V: Clone {
-  pub fn new(capacity: u32) -> BTreeMap<'a, K, V> {
+impl <K, V> BTreeMap<K, V>
+where
+  K: 'static + Copy + Ord,
+  V: 'static + Clone 
+{
+  pub fn new(capacity: u32) -> BTreeMap<K, V> {
     let packed_cells = PackedMemoryArray::with_capacity(capacity);
-    let cells_ptr = NonNull::from(&packed_cells);
-    let index = Self::generate_index(cells_ptr);
+    let data = Arc::new(packed_cells);
+    let index = Self::generate_index(Arc::clone(&data));
+    let (tx, rx) = channel::<BlockIndex<K, V>>();
     
     BTreeMap {
-      data: packed_cells,
-      index,
+      index: Arc::new(RwLock::new(index)),
+      data,
+      tx,
+      rx,
+      pool: ThreadPool::new(1)
     }
   }
 
   pub fn get(&self, key: &K) -> Option<&V> {
-    self.index.get(key)
+    self.fetch_index()
+      .and_then(|idx| {
+        let mut i = self.index.write().unwrap();
+        *i = idx;
+        i.get(key)
+      })
+      .or_else(|| 
+        self.index.read().unwrap().get(key)
+      )
   }
 
   pub fn insert(&mut self, key: K, value: V) -> () where K: Debug {
-    let (block, min_key) = match self.index.get_block_for_insert(&key) {
+    let index = self.index.read().unwrap();
+    let (block, min_key) = match index.get_block_for_insert(&key) {
       SearchResult::Block(block, min_key) => (block, min_key),
       _ => panic!("No block found for insert of key {:?}", key)
     };
@@ -112,15 +136,33 @@ impl <'a, K, V> BTreeMap<'a, K, V> where K: Copy + Ord, V: Clone {
       break;
     }
 
-    let cells_ptr = NonNull::from(&self.data);
-    self.index = Self::generate_index(cells_ptr);
+    let cells_ptr = Arc::downgrade(&self.data);
+    let tx = self.tx.clone();
+    self.pool.execute(move|| {
+      let maybe_cells = cells_ptr.upgrade();
+      if let Some(cells) = maybe_cells {
+        let new_index = Self::generate_index(cells);
+        tx.send(new_index).unwrap();
+      }
+    });
   }
 
-  pub fn generate_index(data: NonNull<PackedMemoryArray<Cell<K,V>>>) -> BlockIndex<'a, K, V> {
+  pub fn generate_index(data: Arc<PackedMemoryArray<Cell<K,V>>>) -> BlockIndex<K, V> {
     BlockIndex {
-      map: data,
+      map: Arc::clone(&data),
       index_tree: BlockSearchTree::new(data)
     }
+  }
+
+  fn fetch_index(&self) -> Option<BlockIndex<K, V>> {
+    self.rx.try_recv().map_or_else(|e| {
+      match e {
+        TryRecvError::Disconnected => panic!("Disconnected??"),
+        TryRecvError::Empty => None
+      }
+    }, |idx| {
+      Some(idx)
+    })
   }
 
   fn rebalance(&self, cell_ptr_start: *const Cell<K, V>, for_insertion: bool) {
@@ -267,7 +309,11 @@ impl <'a, K, V> BTreeMap<'a, K, V> where K: Copy + Ord, V: Clone {
   }
 }
 
-impl <'a, K, V> Debug for BTreeMap<'a, K, V> where K: Copy + Ord + Debug, V: Clone + Debug {
+impl <K, V> Debug for BTreeMap<K, V>
+where
+  K: Copy + Ord + Debug,
+  V: Clone + Debug 
+{
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     formatter
       .debug_struct("BTreeMap")
@@ -276,12 +322,14 @@ impl <'a, K, V> Debug for BTreeMap<'a, K, V> where K: Copy + Ord + Debug, V: Clo
   }
 }
 
-pub struct BlockIndex<'a, K: Copy + Ord, V: Clone> {
-  map: NonNull<PackedMemoryArray<Cell<K, V>>>,
-  index_tree: BlockSearchTree<'a, K, V>
+pub struct BlockIndex<K: Copy + Ord, V: Clone> {
+  map: Arc<PackedMemoryArray<Cell<K, V>>>,
+  index_tree: BlockSearchTree<K, V>
 }
 
-impl <'a, K, V> Debug for BlockIndex<'a, K, V>
+unsafe impl <K: Copy + Ord, V: Clone> Send for BlockIndex<K, V> {}
+
+impl <K, V> Debug for BlockIndex<K, V>
 where
   K: Copy + Ord + Debug,
   V: Clone + Debug 
@@ -295,15 +343,19 @@ where
   }
 }
 
-impl <'a, K, V> BlockIndex<'a, K, V> where K: Copy + Ord, V: Clone {
-  fn get_block_for_insert<Q>(&'a self, search_key: &Q) -> SearchResult<'a, K, V>
+impl <K, V> BlockIndex<K, V>
+where
+  K: Copy + Ord,
+  V: Clone 
+{
+  fn get_block_for_insert<'a, Q>(&'a self, search_key: &Q) -> SearchResult<'a, K, V>
   where
     Q: Ord,
     K: Borrow<Q> {
       self.index_tree.find(search_key, true)
   }
 
-  pub fn get<Q>(&self, search_key: &Q) -> Option<&'a V>
+  pub fn get<'a, Q>(&self, search_key: &Q) -> Option<&'a V>
   where
     Q: Ord,
     K: Borrow<Q>
@@ -313,7 +365,7 @@ impl <'a, K, V> BlockIndex<'a, K, V> where K: Copy + Ord, V: Clone {
       SearchResult::Block(block, ..) => {
         let iter = CellIterator::new(
           block.cell_slice_ptr, 
-          unsafe { self.map.as_ref() }.active_range.end
+          self.map.active_range.end
         );
     
         for cell_guard in iter {
@@ -337,17 +389,16 @@ impl <'a, K, V> BlockIndex<'a, K, V> where K: Copy + Ord, V: Clone {
   }
 }
 
-struct BlockSearchTree<'a, K: Clone + Ord, V: Clone> {
-  nodes: Box<[Node<'a, K, V>]>
+struct BlockSearchTree<K: Clone + Ord, V: Clone> {
+  nodes: Box<[UnsafeCell<Node<K, V>>]>
 }
 
-impl <'a, K, V> BlockSearchTree<'a, K, V>
+impl <'a, K, V> BlockSearchTree<K, V>
 where
   K: Clone + Ord,
   V: Clone
 {
-  fn new(cells: NonNull<PackedMemoryArray<Cell<K,V>>>) -> BlockSearchTree<'a, K, V> {
-    let cells = unsafe { cells.as_ref() };
+  fn new(cells: Arc<PackedMemoryArray<Cell<K,V>>>) -> BlockSearchTree<K, V> {
     let mut nodes = Self::allocate(cells.len());
 
     let mut leaves = Self::initialize_nodes(&mut *nodes, None);
@@ -355,7 +406,7 @@ where
     let mut slots = cells.as_slice().chunks_exact(slot_size);
 
     for leaf in leaves.iter_mut() {
-      Self::finalize_leaf_node(leaf, slots.next().unwrap());
+      Self::finalize_leaf_node(leaf.get_mut(), slots.next().unwrap());
     }
 
     let initialized_nodes = unsafe { nodes.assume_init() };
@@ -365,39 +416,41 @@ where
     }
   }
 
-  fn allocate(leaf_count: usize) -> Box<[MaybeUninit<Node<'a, K, V>>]> {
+  fn allocate(leaf_count: usize) -> Box<[MaybeUninit<UnsafeCell<Node<K, V>>>]> {
     let size = leaf_count;
     // https://github.com/rust-lang/rust/issues/70887
     let slot_size = f32::log2(size as f32) as usize;
     let leaf_count = size / slot_size;
     let node_count = 2 * leaf_count - 1;
     // println!("tree has {:?} leaves, {:?} nodes", leaf_count, node_count);
-    Box::<[Node<K, V>]>::new_uninit_slice(node_count as usize)
+    Box::<[UnsafeCell<Node<K, V>>]>::new_uninit_slice(node_count as usize)
   }
 
   fn initialize_nodes<'b>(
-    nodes: &'b mut [MaybeUninit<Node<'a, K, V>>],
-    parent_node: Option<*mut *const Node<'a, K, V>>,
-  ) -> Vec<&'b mut Node<'a, K, V>> {
+    nodes: &'b mut [MaybeUninit<UnsafeCell<Node<K, V>>>],
+    parent_subtree: Option<*mut NonNull<UnsafeCell<Node<K, V>>>>,
+  ) -> Vec<&'b mut UnsafeCell<Node<K, V>>> {
     if nodes.len() <= 3 {
-      return Self::assign_node_values(nodes, parent_node);
+      return Self::assign_node_values(nodes, parent_subtree);
     }
 
     let (upper_mem, lower_mem) = Self::split_tree_memory(nodes);
     let num_lower_branches = upper_mem.len() + 1;
 
-    let leaves_of_upper = Self::initialize_nodes(upper_mem, parent_node);
+    let leaves_of_upper = Self::initialize_nodes(upper_mem, parent_subtree);
 
     let nodes_per_branch = lower_mem.len() / num_lower_branches;
     let mut branches = lower_mem.chunks_exact_mut(nodes_per_branch);
 
     leaves_of_upper
       .into_iter()
-      .flat_map(|subtree_leaf| match subtree_leaf {
+      .flat_map(|subtree_leaf| match unsafe { &mut *subtree_leaf.get() } {
         Node::Leaf(_, _) => unreachable!(),
         Node::Internal { left, right, .. } => {
           let lhs_mem = branches.next().unwrap();
           let rhs_mem = branches.next().unwrap();
+          // ! I don't think we can use left and right to write into since they are just
+          // ! pointer fields, not containers _for_ pointers...
           let lhs = Self::initialize_nodes(lhs_mem, Some(left.as_mut_ptr()));
           let rhs = Self::initialize_nodes(rhs_mem, Some(right.as_mut_ptr()));
           lhs.into_iter().chain(rhs.into_iter())
@@ -407,19 +460,22 @@ where
   }
 
   fn assign_node_values<'b>(
-    nodes: &'b mut [MaybeUninit<Node<'a, K, V>>],
-    parent_node: Option<*mut *const Node<'a, K, V>>,
-  ) -> Vec<&'b mut Node<'a, K, V>> {
+    nodes: &'b mut [MaybeUninit<UnsafeCell<Node<K, V>>>],
+    parent_subtree: Option<*mut NonNull<UnsafeCell<Node<K, V>>>>,
+  ) -> Vec<&'b mut UnsafeCell<Node<K, V>>> {
     let num_nodes = nodes.len();
     assert!(num_nodes <= 3);
 
     for i in 0..num_nodes as usize {
-      nodes[i].write(Node::Internal {
-        min_rhs: Key::Supremum,
-        left: MaybeUninit::uninit(),
-        right: MaybeUninit::uninit(),
-        _marker: PhantomData,
-      });
+      nodes[i].write(
+        UnsafeCell::new(
+          Node::Internal {
+            min_rhs: Key::Supremum,
+            left: MaybeUninit::uninit(), // Todo: NonNull<MaybeUninit<T>>
+            right: MaybeUninit::uninit(),
+          }
+        )
+      );
     }
 
     if num_nodes == 1 {
@@ -427,20 +483,27 @@ where
       return vec![node];
     }
 
-    let left_node = unsafe { nodes[1].assume_init_ref() } as *const _;
-    let right_node = unsafe { nodes[2].assume_init_ref() } as *const _;
+    let left_node = NonNull::new(unsafe { nodes[1].assume_init_ref() as *const _ } as *mut _).unwrap();
+    let right_node = NonNull::new(unsafe { nodes[2].assume_init_ref() as *const _ } as *mut _).unwrap();
 
-    nodes[0].write(Node::Internal {
-      min_rhs: Key::Supremum,
-      left: MaybeUninit::new(left_node),
-      right: MaybeUninit::new(right_node),
-      _marker: PhantomData,
-    });
+    nodes[0].write(
+      UnsafeCell::new(
+        Node::Internal {
+          min_rhs: Key::Supremum,
+          left: MaybeUninit::new(left_node),
+          right: MaybeUninit::new(right_node),
+        }
+      )
+    );
 
     let (lhs, rhs) = nodes.split_at_mut(2);
 
-    if let Some(node) = parent_node {
-      unsafe { node.write(lhs[0].assume_init_ref() as *const _) };
+    if let Some(node) = parent_subtree {
+      unsafe {
+        NonNull::new((lhs[0].assume_init_ref().get()) as *mut _)
+          .map(|p| node.write(p))
+          .or_else(|| panic!("Pointer is null!"));
+      }
     }
 
     let left_branch = unsafe { lhs[1].assume_init_mut() };
@@ -450,10 +513,10 @@ where
   }
 
   fn split_tree_memory<'b>(
-    nodes: &'b mut [MaybeUninit<Node<'a, K, V>>],
+    nodes: &'b mut [MaybeUninit<UnsafeCell<Node<K, V>>>],
   ) -> (
-    &'b mut [MaybeUninit<Node<'a, K, V>>],
-    &'b mut [MaybeUninit<Node<'a, K, V>>],
+    &'b mut [MaybeUninit<UnsafeCell<Node<K, V>>>],
+    &'b mut [MaybeUninit<UnsafeCell<Node<K, V>>>],
   ) {
     let height = f32::log2(nodes.len() as f32 + 1f32);
     let lower_height = ((height / 2f32).ceil() as u32).next_power_of_two();
@@ -464,7 +527,7 @@ where
   }
 
   fn finalize_leaf_node<'b>(
-    leaf: &'b mut Node<'a, K, V>,
+    leaf: &'b mut Node<K, V>,
     leaf_mem: &'b [Cell<K, V>],
   ) -> () {
     match leaf {
@@ -480,7 +543,6 @@ where
         let block = Block {
           cell_slice_ptr: ptr,
           length,
-          _marker: PhantomData,
         };
         *leaf = Node::Leaf(min_key, block);
       }
@@ -488,8 +550,8 @@ where
     };
   }
 
-  fn root(&'a self) -> &Node<'a, K, V> {
-    &self.nodes[0]
+  fn root(&'a self) -> &Node<K, V> {
+    unsafe { &*self.nodes[0].get() }
   }
 
   fn find<Q>(&'a self, search_key: &Q, for_insertion: bool) -> SearchResult<'a, K, V>
@@ -501,7 +563,7 @@ where
   }
 }
 
-impl <'a, K, V> Debug for BlockSearchTree<'a, K, V>
+impl <K, V> Debug for BlockSearchTree<K, V>
 where
   K: Ord + Clone + Debug,
   V: Clone + Debug 
@@ -514,17 +576,16 @@ where
   }
 }
 
-enum Node<'a, K: Clone + Ord, V: Clone> {
-  Leaf(Key<K>, Block<'a, K, V>),
+enum Node<K: Clone + Ord, V: Clone> {
+  Leaf(Key<K>, Block<K, V>),
   Internal {
     min_rhs: Key<K>,
-    left: MaybeUninit<*const Node<'a, K, V>>,
-    right: MaybeUninit<*const Node<'a, K, V>>,
-    _marker: PhantomData<&'a Node<'a, K, V>>,
+    left: MaybeUninit<NonNull<UnsafeCell<Node<K, V>>>>,
+    right: MaybeUninit<NonNull<UnsafeCell<Node<K, V>>>>,
   },
 }
 
-impl <K, V> Node<'_, K, V> 
+impl <K, V> Node<K, V> 
 where
   K: Clone + Ord,
   V: Clone
@@ -549,11 +610,11 @@ where
         ..
       } => {
         let node = if min_rhs.is_supremum() || key < Key::Value(min_rhs.clone().unwrap().borrow()) {
-          unsafe { &**left.assume_init_ref() }
+          unsafe { &*left.assume_init_ref() }
         } else {
-          unsafe { &**right.assume_init_ref() }
+          unsafe { &*right.assume_init_ref() }
         };
-        SearchResult::Internal(node)
+        SearchResult::Internal(unsafe { &*node.as_ref().get() })
       }
     }
   }
@@ -577,7 +638,7 @@ where
   }
 }
 
-impl <'a, K, V> Debug for Node<'a, K, V>
+impl <K, V> Debug for Node<K, V>
 where
   K: Ord + Clone + Debug,
   V: Clone + Debug 
@@ -601,13 +662,14 @@ where
 }
 
 enum SearchResult<'a, K: Clone + Ord, V: Clone> {
-  Block(&'a Block<'a, K, V>, Key<&'a K>),
-  Internal(&'a Node<'a, K, V>),
+  Block(&'a Block<K, V>, Key<&'a K>),
+  Internal(&'a Node<K, V>),
   NotFound
 } 
 
-struct Block<'a, K: Clone, V: Clone> {
+struct Block<K: Clone, V: Clone> {
   cell_slice_ptr: *const Cell<K, V>,
   length: usize,
-  _marker: PhantomData<&'a [Cell<K, V>]>,
 }
+
+unsafe impl <K: Clone, V: Clone> Send for Block<K, V> {}

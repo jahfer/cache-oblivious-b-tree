@@ -5,6 +5,7 @@
 #![feature(option_insert)]
 #![feature(once_cell)]
 #![feature(box_into_pin)]
+#![feature(ptr_as_uninit)]
 
 mod cache_oblivious;
 pub use cache_oblivious::BTreeMap;
