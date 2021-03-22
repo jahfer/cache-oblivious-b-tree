@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, thread::Thread};
+use std::{borrow::Borrow, thread::{JoinHandle, Thread}};
 use std::fmt::{self, Debug};
 use std::mem::MaybeUninit;
 use std::sync::atomic::Ordering;
@@ -7,8 +7,9 @@ use std::convert::TryInto;
 use std::ptr::NonNull;
 use std::cell::UnsafeCell;
 use std::sync::{Arc, RwLock};
-use std::sync::mpsc::{Receiver, Sender, channel, TryRecvError};
-
+use std::thread;
+use std::time;
+use std::sync::mpsc::{Sender, channel};
 use threadpool::ThreadPool;
 
 use num_rational::{Ratio, Rational};
@@ -20,8 +21,8 @@ pub struct BTreeMap<K: Copy + Ord, V: Clone> {
   data: Arc<PackedMemoryArray<Cell<K,V>>>,
   index: Arc<RwLock<BlockIndex<K, V>>>,
   tx: Sender<BlockIndex<K, V>>,
-  rx: Receiver<BlockIndex<K, V>>,
-  pool: ThreadPool
+  pool: ThreadPool,
+  _index_updater: JoinHandle<()>
 }
 
 impl <K, V> BTreeMap<K, V>
@@ -32,28 +33,36 @@ where
   pub fn new(capacity: u32) -> BTreeMap<K, V> {
     let packed_cells = PackedMemoryArray::with_capacity(capacity);
     let data = Arc::new(packed_cells);
-    let index = Self::generate_index(Arc::clone(&data));
+    let raw_index = Self::generate_index(Arc::clone(&data));
+    let index = Arc::new(RwLock::new(raw_index)); 
     let (tx, rx) = channel::<BlockIndex<K, V>>();
+
+    let thread_index = Arc::clone(&index);
+    let handle = thread::spawn(move|| {
+      loop {
+        if let Ok(new_index) = rx.recv() {
+          let mut i = thread_index.write().unwrap();
+          *i = new_index;
+        } else {
+          break;
+        }
+
+        let sleep_time = time::Duration::from_millis(50);
+        thread::sleep(sleep_time);
+      }
+    });
     
     BTreeMap {
-      index: Arc::new(RwLock::new(index)),
+      index,
       data,
       tx,
-      rx,
-      pool: ThreadPool::new(1)
+      pool: ThreadPool::new(1),
+      _index_updater: handle
     }
   }
 
   pub fn get(&self, key: &K) -> Option<&V> {
-    self.fetch_index()
-      .and_then(|idx| {
-        let mut i = self.index.write().unwrap();
-        *i = idx;
-        i.get(key)
-      })
-      .or_else(|| 
-        self.index.read().unwrap().get(key)
-      )
+    self.index.read().unwrap().get(key)
   }
 
   pub fn insert(&mut self, key: K, value: V) -> () where K: Debug {
@@ -138,6 +147,7 @@ where
 
     let cells_ptr = Arc::downgrade(&self.data);
     let tx = self.tx.clone();
+
     self.pool.execute(move|| {
       let maybe_cells = cells_ptr.upgrade();
       if let Some(cells) = maybe_cells {
@@ -152,17 +162,6 @@ where
       map: Arc::clone(&data),
       index_tree: BlockSearchTree::new(data)
     }
-  }
-
-  fn fetch_index(&self) -> Option<BlockIndex<K, V>> {
-    self.rx.try_recv().map_or_else(|e| {
-      match e {
-        TryRecvError::Disconnected => panic!("Disconnected??"),
-        TryRecvError::Empty => None
-      }
-    }, |idx| {
-      Some(idx)
-    })
   }
 
   fn rebalance(&self, cell_ptr_start: *const Cell<K, V>, for_insertion: bool) {
@@ -328,6 +327,7 @@ pub struct BlockIndex<K: Copy + Ord, V: Clone> {
 }
 
 unsafe impl <K: Copy + Ord, V: Clone> Send for BlockIndex<K, V> {}
+unsafe impl <K: Copy + Ord, V: Clone> Sync for BlockIndex<K, V> {}
 
 impl <K, V> Debug for BlockIndex<K, V>
 where
@@ -449,8 +449,6 @@ where
         Node::Internal { left, right, .. } => {
           let lhs_mem = branches.next().unwrap();
           let rhs_mem = branches.next().unwrap();
-          // ! I don't think we can use left and right to write into since they are just
-          // ! pointer fields, not containers _for_ pointers...
           let lhs = Self::initialize_nodes(lhs_mem, Some(left.as_mut_ptr()));
           let rhs = Self::initialize_nodes(rhs_mem, Some(right.as_mut_ptr()));
           lhs.into_iter().chain(rhs.into_iter())
