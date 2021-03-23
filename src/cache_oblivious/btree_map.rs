@@ -71,16 +71,14 @@ where
       SearchResult::Block(block, min_key) => (block, min_key),
       _ => panic!("No block found for insert of key {:?}", key)
     };
-    
+
     // Todo: Clean up (abstract out CellGuard)
-    // Todo: Optimize iterator; we allocate a Vec<_> that we don't need!
     let iter = self.data
       .into_iter()
       .skip_while(|&x| x as *const _ != block.cell_slice_ptr)
       .map(|c| unsafe { CellGuard::from_raw(c).unwrap() });
 
     let mut selected_cell: Option<CellGuard<K, V>> = None;
-
     for mut cell_guard in iter {
       if cell_guard.is_empty() {
         // node says there's a cell smaller than ours, keep looking
