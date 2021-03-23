@@ -13,6 +13,8 @@ pub use cache_oblivious::BTreeMap;
 #[cfg(test)]
 mod tests {
   use crate::BTreeMap;
+  use std::time;
+  use std::thread;
 
   #[test]
   fn find_missing() {
@@ -33,6 +35,9 @@ mod tests {
     tree.insert(3, String::from("Hello"));
     tree.insert(8, String::from("World"));
     tree.insert(12, String::from("!"));
+
+    // index update is delayed
+    thread::sleep(time::Duration::from_millis(50));
   
     assert_eq!(tree.get(&3), Some(&String::from("Hello")));
     assert_eq!(tree.get(&8), Some(&String::from("World")));
@@ -58,6 +63,9 @@ mod tests {
     for i in 1..100u8 {
       tree.insert(i, i+1);
     }
+
+    // index update is delayed
+    thread::sleep(time::Duration::from_millis(50));
   
     assert_eq!(tree.get(&99), Some(&100));
   }

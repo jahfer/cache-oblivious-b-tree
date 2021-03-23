@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, thread::{JoinHandle, Thread}};
+use std::borrow::Borrow;
 use std::fmt::{self, Debug};
 use std::mem::MaybeUninit;
 use std::sync::atomic::Ordering;
@@ -7,7 +7,7 @@ use std::convert::TryInto;
 use std::ptr::NonNull;
 use std::cell::UnsafeCell;
 use std::sync::{Arc, RwLock};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time;
 use std::sync::mpsc::{Sender, channel};
 use threadpool::ThreadPool;
@@ -16,6 +16,8 @@ use num_rational::{Ratio, Rational};
 
 use super::packed_memory_array::PackedMemoryArray;
 use super::cell::{Cell, Key, CellIterator, CellGuard, Marker};
+
+const INDEX_UPDATE_DELAY: time::Duration = time::Duration::from_millis(50);
 
 pub struct BTreeMap<K: Copy + Ord, V: Clone> {
   data: Arc<PackedMemoryArray<Cell<K,V>>>,
@@ -46,9 +48,7 @@ where
         } else {
           break;
         }
-
-        let sleep_time = time::Duration::from_millis(50);
-        thread::sleep(sleep_time);
+        thread::sleep(INDEX_UPDATE_DELAY);
       }
     });
     
@@ -73,15 +73,15 @@ where
     };
     
     // Todo: Clean up (abstract out CellGuard)
-    let vec = self.data
+    // Todo: Optimize iterator; we allocate a Vec<_> that we don't need!
+    let iter = self.data
       .into_iter()
       .skip_while(|&x| x as *const _ != block.cell_slice_ptr)
-      .map(|c| unsafe { CellGuard::from_raw(c).unwrap() })
-      .collect::<Vec<_>>();
+      .map(|c| unsafe { CellGuard::from_raw(c).unwrap() });
 
     let mut selected_cell: Option<CellGuard<K, V>> = None;
 
-    for mut cell_guard in vec {
+    for mut cell_guard in iter {
       if cell_guard.is_empty() {
         // node says there's a cell smaller than ours, keep looking
         if selected_cell.is_none() && min_key <= Key::Value(&key) {
