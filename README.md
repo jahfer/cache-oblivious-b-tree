@@ -7,15 +7,15 @@ Notes on this project begin at http://jahfer.com/posts/co-btree-0/
 ```rust
 #[cfg(test)]
 mod tests {
-  use crate::StaticSearchTree;
+  use crate::BTreeMap;
 
   #[test]
   fn test() {
-    let mut tree = StaticSearchTree::<u8, &str>::new(30);
-    tree.add(6, "World!");
-    tree.add(5, "Hello");
-    assert_eq!(tree.find(5), Some("Hello"));
-    assert_eq!(tree.find(6), Some("World!"));
+    let mut tree = BTreeMap::<u8, String>::new(30);
+    tree.insert(6, "World!");
+    tree.insert(5, "Hello");
+    assert_eq!(tree.get(&5), Some(&String::from("Hello")));
+    assert_eq!(tree.get(&6), Some(&String::from("World!")));
   }
 }
 ```
