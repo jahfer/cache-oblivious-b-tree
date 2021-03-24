@@ -7,6 +7,10 @@
 #![feature(box_into_pin)]
 #![feature(ptr_as_uninit)]
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 mod cache_oblivious;
 pub use cache_oblivious::BTreeMap;
 
@@ -50,6 +54,9 @@ mod tests {
     tree.insert(5, String::from("Hello"));
     tree.insert(3, String::from("World"));
     tree.insert(2, String::from("!"));
+
+    // index update is delayed
+    thread::sleep(time::Duration::from_millis(50));
 
     assert_eq!(tree.get(&5), Some(&String::from("Hello")));
     assert_eq!(tree.get(&4), None);
