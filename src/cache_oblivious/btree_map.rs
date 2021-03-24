@@ -1,16 +1,15 @@
 use std::borrow::Borrow;
 use std::fmt::{self, Debug};
 use std::mem::MaybeUninit;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{Ordering, AtomicBool};
 use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::ptr::NonNull;
 use std::cell::UnsafeCell;
-use std::sync::{Arc, RwLock};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, RwLock, Weak};
+use std::thread;
 use std::time;
-use std::sync::mpsc::{Sender, channel};
-use threadpool::ThreadPool;
+use std::sync::mpsc::{Sender, Receiver, channel};
 
 use num_rational::{Ratio, Rational};
 
@@ -22,9 +21,8 @@ const INDEX_UPDATE_DELAY: time::Duration = time::Duration::from_millis(50);
 pub struct BTreeMap<K: Copy + Ord, V: Clone> {
   data: Arc<PackedMemoryArray<Cell<K,V>>>,
   index: Arc<RwLock<BlockIndex<K, V>>>,
-  tx: Sender<BlockIndex<K, V>>,
-  pool: ThreadPool,
-  _index_updater: JoinHandle<()>
+  tx: Sender<Weak<PackedMemoryArray<Cell<K, V>>>>,
+  index_updating: Arc<AtomicBool>
 }
 
 impl <K, V> BTreeMap<K, V>
@@ -35,29 +33,19 @@ where
   pub fn new(capacity: u32) -> BTreeMap<K, V> {
     let packed_cells = PackedMemoryArray::with_capacity(capacity);
     let data = Arc::new(packed_cells);
-    let raw_index = Self::generate_index(Arc::clone(&data));
-    let index = Arc::new(RwLock::new(raw_index)); 
-    let (tx, rx) = channel::<BlockIndex<K, V>>();
 
+    let raw_index = Self::generate_index(Arc::clone(&data));
+    let index = Arc::new(RwLock::new(raw_index));
+    
     let thread_index = Arc::clone(&index);
-    let handle = thread::spawn(move|| {
-      loop {
-        if let Ok(new_index) = rx.recv() {
-          let mut i = thread_index.write().unwrap();
-          *i = new_index;
-        } else {
-          break;
-        }
-        thread::sleep(INDEX_UPDATE_DELAY);
-      }
-    });
+    let (tx, rx) = channel::<Weak<PackedMemoryArray<Cell<K, V>>>>();
+    let index_updating = Self::start_indexing_thread(thread_index, rx);
     
     BTreeMap {
       index,
       data,
       tx,
-      pool: ThreadPool::new(1),
-      _index_updater: handle
+      index_updating
     }
   }
 
@@ -109,6 +97,7 @@ where
 
       let marker_version = cell_guard.cache_version + 1;
       let cell = selected_cell.as_mut().unwrap_or(&mut cell_guard);
+
       let marker = Marker::InsertCell(marker_version, key, value.clone());
 
       let result = cell.update(marker);
@@ -143,16 +132,7 @@ where
       break;
     }
 
-    let cells_ptr = Arc::downgrade(&self.data);
-    let tx = self.tx.clone();
-
-    self.pool.execute(move|| {
-      let maybe_cells = cells_ptr.upgrade();
-      if let Some(cells) = maybe_cells {
-        let new_index = Self::generate_index(cells);
-        tx.send(new_index).unwrap();
-      }
-    });
+    self.request_reindex();
   }
 
   pub fn generate_index(data: Arc<PackedMemoryArray<Cell<K,V>>>) -> BlockIndex<K, V> {
@@ -160,6 +140,43 @@ where
       map: Arc::clone(&data),
       index_tree: BlockSearchTree::new(data)
     }
+  }
+
+  fn request_reindex(&self) {
+    // debounce
+    if !self.index_updating.load(Ordering::Acquire) {
+      let _ = self.tx.send(Arc::downgrade(&self.data));
+    }
+  }
+
+  fn start_indexing_thread(index: Arc<RwLock<BlockIndex<K,V>>>, rx: Receiver<Weak<PackedMemoryArray<Cell<K,V>>>>) -> Arc<AtomicBool> {
+    let is_updating = Arc::new(AtomicBool::new(false));
+    let thread_is_updating = Arc::clone(&is_updating);
+    thread::spawn(move|| {
+      loop {
+        let result = rx.recv().ok()
+          .map(|x| {
+            thread_is_updating.store(true, Ordering::Release);
+            x
+          })
+          .and_then(|cells_ptr| cells_ptr.upgrade())
+          .map(|cells| {
+            let new_index = Self::generate_index(cells);
+            let mut i = index.write().unwrap();
+            // todo is the memory barrier in the right place here, relative to the index generation?
+            thread_is_updating.store(false, Ordering::Release);
+            *i = new_index;
+          });
+
+        if let None = result {
+          break;
+        }
+
+        thread::sleep(INDEX_UPDATE_DELAY);
+      }
+    });
+
+    is_updating
   }
 
   fn rebalance(&self, cell_ptr_start: *const Cell<K, V>, for_insertion: bool) {
@@ -212,8 +229,6 @@ where
 
     // TODO: Can we use #compare_and_swap for neighbouring cells
     // to make sure we don't leave any cells unallocated?
-
-    println!("Identified {} cells to relocate", cells_to_move.len());
 
     for cell_ptr in cells_to_move.iter() {
       let cell = unsafe { &*current_cell_ptr };
