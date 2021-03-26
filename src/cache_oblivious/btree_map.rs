@@ -18,7 +18,7 @@ use super::cell::{Cell, Key, CellIterator, CellGuard, Marker};
 
 const INDEX_UPDATE_DELAY: time::Duration = time::Duration::from_millis(50);
 
-pub struct BTreeMap<K: Copy + Ord, V: Clone> {
+pub struct BTreeMap<K: Clone + Ord, V: Clone> {
   data: Arc<PackedMemoryArray<Cell<K,V>>>,
   index: Arc<RwLock<BlockIndex<K, V>>>,
   tx: Sender<Weak<PackedMemoryArray<Cell<K, V>>>>,
@@ -27,7 +27,7 @@ pub struct BTreeMap<K: Copy + Ord, V: Clone> {
 
 impl <K, V> BTreeMap<K, V>
 where
-  K: 'static + Copy + Ord,
+  K: 'static + Clone + Ord,
   V: 'static + Clone 
 {
   pub fn new(capacity: u32) -> BTreeMap<K, V> {
@@ -52,11 +52,12 @@ where
   pub fn get<Q>(&self, key: &Q) -> Option<&V>
   where
     Q: Ord,
-    K: Borrow<Q> {
+    K: Borrow<Q>
+  {
     self.index.read().unwrap().get(key)
   }
 
-  pub fn insert(&mut self, key: K, value: V) -> () where K: Debug {
+  pub fn insert<'a>(&'a mut self, key: K, value: V) where K: Debug {
     let index = self.index.read().unwrap();
     let (block, min_key) = match index.get_block_for_insert(&key) {
       SearchResult::Block(block, min_key) => (block, min_key),
@@ -81,10 +82,10 @@ where
         }
       } else {
         let cache = cell_guard.cache().unwrap().clone().unwrap();
-        if Key::Value(cache.key) < Key::Value(key) {
+        if Key::Value(&cache.key) < Key::Value(&key) {
           selected_cell = Some(cell_guard);
           continue
-        } else if Key::Value(cache.key) == Key::Value(key) {
+        } else if Key::Value(&cache.key) == Key::Value(&key) {
           selected_cell = None;
         } else if selected_cell.is_none() {
           // we didn't find any cells that were <= our key, rebalance to make room
@@ -101,7 +102,7 @@ where
       let marker_version = cell_guard.cache_version + 1;
       let cell = selected_cell.as_mut().unwrap_or(&mut cell_guard);
 
-      let marker = Marker::InsertCell(marker_version, key, value.clone());
+      let marker = Marker::InsertCell(marker_version, key.clone(), value.clone());
 
       let result = cell.update(marker);
       
@@ -235,7 +236,7 @@ where
 
     for cell_ptr in cells_to_move.iter() {
       let cell = unsafe { &*current_cell_ptr };
-      let cell_key = unsafe { *cell.key.get() };
+      let cell_key = unsafe { &*cell.key.get() };
       if cell_key.is_some() {
         // TODO: I think we can overwrite these records since their contents have been moved...
       }
@@ -276,7 +277,7 @@ where
 
       unsafe {
         // update new cell
-        cell.key.get().write(*cell_to_move.key.get());
+        cell.key.get().write((*cell_to_move.key.get()).clone());
         cell.value.get().write((*cell_to_move.value.get()).clone());
         // todo update version and marker of new cell?
 
@@ -337,17 +338,17 @@ where
   }
 }
 
-pub struct BlockIndex<K: Copy + Ord, V: Clone> {
+pub struct BlockIndex<K: Clone + Ord, V: Clone> {
   map: Arc<PackedMemoryArray<Cell<K, V>>>,
   index_tree: BlockSearchTree<K, V>
 }
 
-unsafe impl <K: Copy + Ord, V: Clone> Send for BlockIndex<K, V> {}
-unsafe impl <K: Copy + Ord, V: Clone> Sync for BlockIndex<K, V> {}
+unsafe impl <K: Clone + Ord, V: Clone> Send for BlockIndex<K, V> {}
+unsafe impl <K: Clone + Ord, V: Clone> Sync for BlockIndex<K, V> {}
 
 impl <K, V> Debug for BlockIndex<K, V>
 where
-  K: Copy + Ord + Debug,
+  K: Clone + Ord + Debug,
   V: Clone + Debug 
 {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -361,7 +362,7 @@ where
 
 impl <K, V> BlockIndex<K, V>
 where
-  K: Copy + Ord,
+  K: Clone + Ord,
   V: Clone 
 {
   fn get_block_for_insert<'a, Q>(&'a self, search_key: &Q) -> SearchResult<'a, K, V>
