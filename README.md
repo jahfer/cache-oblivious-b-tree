@@ -12,10 +12,14 @@ mod tests {
   #[test]
   fn test() {
     let mut tree = BTreeMap::<u8, String>::new(30);
-    tree.insert(6, "World!");
-    tree.insert(5, "Hello");
-    assert_eq!(tree.get(&5), Some(&String::from("Hello")));
-    assert_eq!(tree.get(&6), Some(&String::from("World!")));
+    let value1 = "Hello";
+    let value2 = "World";
+
+    tree.insert(5, value1.to_string());
+    tree.insert(6, value2.to_string());
+    
+    assert_eq!(tree.get(&5), Some(&value1));
+    assert_eq!(tree.get(&6), Some(&value2));
   }
 }
 ```

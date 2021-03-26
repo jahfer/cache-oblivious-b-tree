@@ -49,7 +49,10 @@ where
     }
   }
 
-  pub fn get(&self, key: &K) -> Option<&V> {
+  pub fn get<Q>(&self, key: &Q) -> Option<&V>
+  where
+    Q: Ord,
+    K: Borrow<Q> {
     self.index.read().unwrap().get(key)
   }
 
