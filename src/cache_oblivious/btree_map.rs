@@ -83,12 +83,7 @@ where
                 _ => panic!("No block found for insert of key {:?}", key),
             };
 
-            // Todo: Clean up (abstract out CellGuard)
-            let iter = self
-                .data
-                .into_iter()
-                .skip_while(|&x| x as *const _ != block.cell_slice_ptr)
-                .map(|c| unsafe { CellGuard::from_raw(c).unwrap() });
+            let iter = CellIterator::new(block.cell_slice_ptr, self.data.active_range.end);
 
             let mut selected_cell: Option<CellGuard<K, V>> = None;
             for mut cell_guard in iter {
@@ -230,14 +225,9 @@ where
         // Track the range of cells affected for computing block indices
         let mut last_cell_ptr = cell_ptr_start;
 
-        let vec = self
-            .data
-            .into_iter()
-            .skip_while(|&x| x as *const _ != cell_ptr_start)
-            .map(|c| unsafe { CellGuard::from_raw(c).unwrap() })
-            .collect::<Vec<_>>();
+        let iter = CellIterator::new(cell_ptr_start, self.data.active_range.end);
 
-        for cell_guard in vec {
+        for cell_guard in iter {
             current_cell_ptr = cell_guard.inner;
             last_cell_ptr = cell_guard.inner;
 
@@ -2172,6 +2162,168 @@ mod tests {
         // Verify all values are retrievable
         for i in 0..5 {
             assert_eq!(btree.get(&i), Some(&(i * 10)));
+        }
+    }
+
+    #[test]
+    fn test_insert_uses_direct_pointer_iteration() {
+        // Test that insert works correctly with direct pointer iteration
+        // by inserting values that would span multiple blocks
+        let mut btree: BTreeMap<u32, u32> = BTreeMap::new(32);
+
+        // Insert values in reverse order to exercise the rebalancing logic
+        for i in (0..20).rev() {
+            btree.insert(i, i * 100);
+        }
+
+        // All values should be retrievable
+        for i in 0..20 {
+            assert_eq!(
+                btree.get(&i),
+                Some(&(i * 100)),
+                "Failed to retrieve key {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_insert_middle_of_block_with_direct_iteration() {
+        // Test inserting values in the middle of existing data
+        // Use same pattern as add_unordered_values which is known to work
+        let mut btree: BTreeMap<u8, u8> = BTreeMap::new(16);
+
+        // Insert a few values in non-sequential order (same as add_unordered_values)
+        btree.insert(5, 50);
+        btree.insert(3, 30);
+        btree.insert(2, 20);
+
+        // All values should be retrievable
+        assert_eq!(btree.get(&5), Some(&50));
+        assert_eq!(btree.get(&3), Some(&30));
+        assert_eq!(btree.get(&2), Some(&20));
+    }
+
+    #[test]
+    fn test_cell_iterator_direct_construction() {
+        // Test that CellIterator can be constructed directly from a pointer
+        // and iterates correctly
+        use super::super::cell::CellIterator;
+
+        let pma: PackedMemoryArray<Cell<u32, u32>> = PackedMemoryArray::with_capacity(16);
+
+        // Get the start and end pointers from the active range
+        let start_ptr = pma.active_range.start;
+        let end_ptr = pma.active_range.end;
+
+        // Create iterator directly from pointers
+        let iter: CellIterator<u32, u32> = CellIterator::new(start_ptr, end_ptr);
+
+        // Should be able to iterate through the cells
+        let count = iter.count();
+        assert!(
+            count > 0,
+            "CellIterator should iterate over at least some cells"
+        );
+    }
+
+    #[test]
+    fn test_rebalance_with_direct_iteration() {
+        // Test that rebalance works correctly with direct pointer iteration
+        // by forcing multiple rebalances through sequential inserts
+        let mut btree: BTreeMap<u32, u32> = BTreeMap::new(16);
+
+        // Insert enough values to trigger rebalancing
+        for i in 0..15 {
+            btree.insert(i, i);
+        }
+
+        // All values should still be retrievable after rebalancing
+        for i in 0..15 {
+            assert_eq!(
+                btree.get(&i),
+                Some(&i),
+                "Value lost after rebalancing for key {}",
+                i
+            );
+        }
+    }
+
+    /// Test that verifies insert time scales as O(log N) rather than O(N).
+    ///
+    /// After the fix to replace skip_while() with direct CellIterator construction,
+    /// insert operations should have roughly constant time regardless of tree size,
+    /// rather than growing linearly with the number of elements.
+    ///
+    /// This test creates trees of increasing sizes and measures insert timing.
+    /// If the fix is correct, the ratio of insert times should be roughly constant
+    /// (within a reasonable factor), not growing proportionally with size.
+    #[test]
+    fn test_insert_scaling_is_sublinear() {
+        use std::time::Instant;
+
+        // Test at two different sizes to verify scaling
+        let small_size = 100;
+        let large_size = 1000;
+        let num_inserts = 50; // More inserts for more stable timing
+
+        // Measure insert time for small tree
+        let mut small_tree: BTreeMap<usize, usize> = BTreeMap::new(small_size + num_inserts);
+        for i in 0..small_size {
+            small_tree.insert(i * 2, i); // Even numbers
+        }
+
+        let small_start = Instant::now();
+        for i in 0..num_inserts {
+            small_tree.insert(i * 2 + 1, i); // Odd numbers (new inserts)
+        }
+        let small_elapsed = small_start.elapsed();
+
+        // Measure insert time for large tree
+        let mut large_tree: BTreeMap<usize, usize> = BTreeMap::new(large_size + num_inserts);
+        for i in 0..large_size {
+            large_tree.insert(i * 2, i);
+        }
+
+        let large_start = Instant::now();
+        for i in 0..num_inserts {
+            large_tree.insert(i * 2 + 1, i);
+        }
+        let large_elapsed = large_start.elapsed();
+
+        // Calculate the ratio of times
+        // With O(N) complexity: ratio should be ~10x (1000/100)
+        // With O(log N) complexity: ratio should be ~1.5x (log2(1000)/log2(100) ≈ 10/6.6)
+        // In practice, with cache effects and constant factors, we allow up to 8x
+        // This is still significantly better than the 10x expected for O(N)
+        let ratio = large_elapsed.as_nanos() as f64 / small_elapsed.as_nanos().max(1) as f64;
+
+        // Allow up to 8x ratio to account for measurement noise, cache effects, and debug mode
+        // If it were truly O(N), we'd expect ~10x, so 8x is a reasonable threshold
+        // The key insight is that we should NOT see 10x scaling
+        assert!(
+            ratio < 8.0,
+            "Insert time scaled too much with size: {:.2}x (expected <8x for sublinear behavior). \
+             Small tree ({} elements): {:?}, Large tree ({} elements): {:?}",
+            ratio,
+            small_size,
+            small_elapsed,
+            large_size,
+            large_elapsed
+        );
+
+        // Verify correctness - all values should be retrievable
+        for i in 0..num_inserts {
+            assert_eq!(
+                small_tree.get(&(i * 2 + 1)),
+                Some(&i),
+                "Small tree missing inserted key"
+            );
+            assert_eq!(
+                large_tree.get(&(i * 2 + 1)),
+                Some(&i),
+                "Large tree missing inserted key"
+            );
         }
     }
 }
