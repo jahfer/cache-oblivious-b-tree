@@ -2294,15 +2294,15 @@ mod tests {
         // Calculate the ratio of times
         // With O(N) complexity: ratio should be ~10x (1000/100)
         // With O(log N) complexity: ratio should be ~1.5x (log2(1000)/log2(100) ≈ 10/6.6)
-        // In practice, with cache effects and constant factors, we allow up to 8x
+        // In practice, with cache effects and constant factors, we allow up to 3x
         // This is still significantly better than the 10x expected for O(N)
         let ratio = large_elapsed.as_nanos() as f64 / small_elapsed.as_nanos().max(1) as f64;
 
         // Allow up to 8x ratio to account for measurement noise, cache effects, and debug mode
-        // If it were truly O(N), we'd expect ~10x, so 8x is a reasonable threshold
+        // If it were truly O(N), we'd expect ~10x, so 3x is an agressive threshold
         // The key insight is that we should NOT see 10x scaling
         assert!(
-            ratio < 8.0,
+            ratio < 3.0,
             "Insert time scaled too much with size: {:.2}x (expected <8x for sublinear behavior). \
              Small tree ({} elements): {:?}, Large tree ({} elements): {:?}",
             ratio,
