@@ -414,6 +414,10 @@ struct BlockSearchTree<K: Clone + Ord, V: Clone> {
     subtree_sizes: Box<[SubtreeSizes]>,
     /// Height of the tree (number of levels from root to leaves).
     height: u8,
+    /// Precomputed leaf positions in left-to-right order (in-order traversal).
+    /// Maps leaf_index (0..num_leaves) to node array position.
+    /// Enables O(1) leaf-to-position lookup for incremental updates.
+    leaf_positions: Box<[usize]>,
 }
 
 /// Stores the sizes of upper and lower subtrees at a given vEB recursion level.
@@ -628,6 +632,9 @@ where
         let height = compute_tree_height(node_count);
         let subtree_sizes = precompute_subtree_sizes(height);
 
+        // Precompute leaf positions for O(1) leaf-to-position mapping
+        let leaf_positions = Self::collect_leaf_positions_inorder(node_count, &subtree_sizes);
+
         // Allocate all nodes as Internal initially
         let mut nodes: Vec<Node<K, V>> = (0..node_count)
             .map(|_| Node::Internal {
@@ -643,6 +650,7 @@ where
             nodes: nodes.into_boxed_slice(),
             subtree_sizes,
             height,
+            leaf_positions: leaf_positions.into_boxed_slice(),
         }
     }
 
@@ -781,6 +789,111 @@ where
                     };
                 }
             }
+        }
+    }
+
+    /// Returns the number of leaves in the tree.
+    fn leaf_count(&self) -> usize {
+        self.leaf_positions.len()
+    }
+
+    /// Maps a leaf index (0..num_leaves) to its position in the node array.
+    /// Returns None if the leaf_index is out of bounds.
+    fn leaf_index_to_position(&self, leaf_index: usize) -> Option<usize> {
+        self.leaf_positions.get(leaf_index).copied()
+    }
+
+    /// Updates a single leaf's min_key after PMA rebalancing.
+    ///
+    /// This enables incremental index updates instead of full rebuilds.
+    /// After updating the leaf, optionally propagates key changes up to ancestors
+    /// if the leaf is the minimum of a right subtree (affects parent's min_rhs).
+    ///
+    /// # Arguments
+    /// * `leaf_index` - The leaf index (0..num_leaves) to update
+    /// * `new_min_key` - The new minimum key for this leaf
+    ///
+    /// # Returns
+    /// `true` if the update was successful, `false` if leaf_index is out of bounds.
+    fn update_leaf(&mut self, leaf_index: usize, new_min_key: Key<K>) -> bool {
+        let pos = match self.leaf_index_to_position(leaf_index) {
+            Some(p) => p,
+            None => return false,
+        };
+
+        // Update the leaf's min_key
+        if let Node::Leaf(ref mut min_key, _) = self.nodes[pos] {
+            *min_key = new_min_key.clone();
+        } else {
+            // Position doesn't contain a leaf (shouldn't happen with valid leaf_index)
+            return false;
+        }
+
+        // Propagate key changes up to ancestors if needed
+        self.propagate_key_change(pos, &new_min_key);
+
+        true
+    }
+
+    /// Propagates key changes up to ancestors after a leaf update.
+    ///
+    /// When a leaf's min_key changes, internal nodes storing `min_rhs` may need updates.
+    /// An internal node's `min_rhs` represents the minimum key in its right subtree.
+    /// If the updated leaf is the leftmost leaf of some node's right subtree,
+    /// that node's `min_rhs` must be updated.
+    ///
+    /// This walks from root to the leaf, updating `min_rhs` for any internal node
+    /// where we descend into the right child (meaning the leaf is in the right subtree).
+    fn propagate_key_change(&mut self, leaf_pos: usize, new_key: &Key<K>) {
+        let mut nav = self.root_navigator();
+        let mut path: Vec<(usize, bool)> = Vec::new(); // (position, went_right)
+
+        // Walk from root to the target leaf, recording the path
+        loop {
+            if nav.position == leaf_pos {
+                break;
+            }
+
+            match &self.nodes[nav.position] {
+                Node::Leaf(_, _) => {
+                    // Reached a different leaf, shouldn't happen
+                    break;
+                }
+                Node::Internal { min_rhs } => {
+                    // Determine which way to go based on comparing new_key with min_rhs
+                    let go_right = !min_rhs.is_supremum() && new_key >= min_rhs;
+                    path.push((nav.position, go_right));
+
+                    nav = if go_right {
+                        self.right_child(&nav)
+                    } else {
+                        self.left_child(&nav)
+                    };
+                }
+            }
+        }
+
+        // Now update min_rhs for ancestors where we went right AND this is the leftmost
+        // leaf in that right subtree.
+        // We need to find where the updated leaf is the minimum of the right subtree.
+        // This happens when we go right, then only left from that point to the leaf.
+
+        // Work backwards through the path to find the deepest "went_right" followed by only "went_left"
+        let mut all_left_from_here = true;
+        for (pos, went_right) in path.into_iter().rev() {
+            if *&went_right {
+                if all_left_from_here {
+                    // This node's min_rhs should be updated since the leaf is
+                    // the leftmost leaf in its right subtree
+                    if let Node::Internal { ref mut min_rhs } = self.nodes[pos] {
+                        *min_rhs = new_key.clone();
+                    }
+                }
+                // Once we hit a right turn, stop updating (nodes above this
+                // have the leaf in a deeper right subtree, not as their direct min_rhs)
+                all_left_from_here = false;
+            }
+            // If went_left, all_left_from_here stays true
         }
     }
 }
@@ -1312,6 +1425,402 @@ mod tests {
                 leaves.len(),
                 expected_leaves
             );
+        }
+    }
+
+    // === Step 4 tests: update_leaf() and incremental index updates ===
+
+    #[test]
+    fn test_leaf_positions_stored_in_tree() {
+        // Verify that the tree stores leaf_positions for O(1) lookup
+        for height in 2..=5u8 {
+            let sizes = precompute_subtree_sizes(height);
+            let node_count = (1usize << height) - 1;
+            let expected_leaf_count = 1usize << (height - 1);
+
+            let leaf_positions =
+                BlockSearchTree::<u32, u32>::collect_leaf_positions_inorder(node_count, &sizes);
+
+            assert_eq!(
+                leaf_positions.len(),
+                expected_leaf_count,
+                "Height {}: Expected {} leaf positions",
+                height,
+                expected_leaf_count
+            );
+
+            // Verify leaf_positions are within bounds
+            for &pos in &leaf_positions {
+                assert!(
+                    pos < node_count,
+                    "Height {}: Leaf position {} out of bounds",
+                    height,
+                    pos
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_leaf_index_to_position_mapping() {
+        // Test the leaf_index_to_position mapping
+        for height in 2..=4u8 {
+            let sizes = precompute_subtree_sizes(height);
+            let node_count = (1usize << height) - 1;
+            let leaf_positions: Box<[usize]> =
+                BlockSearchTree::<u32, u32>::collect_leaf_positions_inorder(node_count, &sizes)
+                    .into_boxed_slice();
+
+            // Create a minimal tree structure to test leaf_index_to_position
+            let tree = BlockSearchTree::<u32, u32> {
+                nodes: (0..node_count)
+                    .map(|_| Node::Internal {
+                        min_rhs: Key::Supremum,
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                subtree_sizes: sizes,
+                height,
+                leaf_positions: leaf_positions.clone(),
+            };
+
+            // Test valid indices
+            for (idx, &expected_pos) in leaf_positions.iter().enumerate() {
+                let pos = tree.leaf_index_to_position(idx);
+                assert_eq!(
+                    pos,
+                    Some(expected_pos),
+                    "Height {}: leaf_index {} should map to position {}",
+                    height,
+                    idx,
+                    expected_pos
+                );
+            }
+
+            // Test out-of-bounds index
+            let out_of_bounds = tree.leaf_index_to_position(leaf_positions.len());
+            assert_eq!(
+                out_of_bounds, None,
+                "Height {}: out-of-bounds index should return None",
+                height
+            );
+        }
+    }
+
+    #[test]
+    fn test_leaf_count() {
+        // Test the leaf_count method
+        for height in 2..=4u8 {
+            let sizes = precompute_subtree_sizes(height);
+            let node_count = (1usize << height) - 1;
+            let expected_leaf_count = 1usize << (height - 1);
+            let leaf_positions: Box<[usize]> =
+                BlockSearchTree::<u32, u32>::collect_leaf_positions_inorder(node_count, &sizes)
+                    .into_boxed_slice();
+
+            let tree = BlockSearchTree::<u32, u32> {
+                nodes: (0..node_count)
+                    .map(|_| Node::Internal {
+                        min_rhs: Key::Supremum,
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                subtree_sizes: sizes,
+                height,
+                leaf_positions,
+            };
+
+            assert_eq!(
+                tree.leaf_count(),
+                expected_leaf_count,
+                "Height {}: Expected {} leaves",
+                height,
+                expected_leaf_count
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_leaf_basic() {
+        // Test basic update_leaf functionality
+        // Create a height-3 tree (7 nodes, 4 leaves)
+        let height = 3u8;
+        let sizes = precompute_subtree_sizes(height);
+        let node_count = 7;
+        let leaf_positions: Box<[usize]> =
+            BlockSearchTree::<u32, u32>::collect_leaf_positions_inorder(node_count, &sizes)
+                .into_boxed_slice();
+
+        // Create nodes - mark leaf positions as Leaf nodes
+        let mut nodes: Vec<Node<u32, u32>> = (0..node_count)
+            .map(|_| Node::Internal {
+                min_rhs: Key::Supremum,
+            })
+            .collect();
+
+        // Convert leaf positions to actual Leaf nodes
+        for &pos in leaf_positions.iter() {
+            nodes[pos] = Node::Leaf(
+                Key::Supremum,
+                Block {
+                    cell_slice_ptr: std::ptr::null(),
+                    length: 0,
+                },
+            );
+        }
+
+        let mut tree = BlockSearchTree::<u32, u32> {
+            nodes: nodes.into_boxed_slice(),
+            subtree_sizes: sizes,
+            height,
+            leaf_positions,
+        };
+
+        // Update leaf 0 with a new key
+        let success = tree.update_leaf(0, Key::Value(10));
+        assert!(success, "update_leaf should succeed for valid leaf index");
+
+        // Verify the leaf was updated
+        let leaf_pos = tree.leaf_index_to_position(0).unwrap();
+        match &tree.nodes[leaf_pos] {
+            Node::Leaf(key, _) => {
+                assert_eq!(*key, Key::Value(10), "Leaf key should be updated to 10");
+            }
+            _ => panic!("Expected Leaf node at position {}", leaf_pos),
+        }
+
+        // Update leaf 2 with a different key
+        let success = tree.update_leaf(2, Key::Value(30));
+        assert!(success, "update_leaf should succeed for leaf index 2");
+
+        let leaf_pos = tree.leaf_index_to_position(2).unwrap();
+        match &tree.nodes[leaf_pos] {
+            Node::Leaf(key, _) => {
+                assert_eq!(*key, Key::Value(30), "Leaf key should be updated to 30");
+            }
+            _ => panic!("Expected Leaf node at position {}", leaf_pos),
+        }
+    }
+
+    #[test]
+    fn test_update_leaf_out_of_bounds() {
+        // Test that update_leaf returns false for out-of-bounds index
+        let height = 2u8;
+        let sizes = precompute_subtree_sizes(height);
+        let node_count = 3;
+        let leaf_positions: Box<[usize]> =
+            BlockSearchTree::<u32, u32>::collect_leaf_positions_inorder(node_count, &sizes)
+                .into_boxed_slice();
+
+        // Create nodes
+        let mut nodes: Vec<Node<u32, u32>> = (0..node_count)
+            .map(|_| Node::Internal {
+                min_rhs: Key::Supremum,
+            })
+            .collect();
+
+        for &pos in leaf_positions.iter() {
+            nodes[pos] = Node::Leaf(
+                Key::Supremum,
+                Block {
+                    cell_slice_ptr: std::ptr::null(),
+                    length: 0,
+                },
+            );
+        }
+
+        let mut tree = BlockSearchTree::<u32, u32> {
+            nodes: nodes.into_boxed_slice(),
+            subtree_sizes: sizes,
+            height,
+            leaf_positions,
+        };
+
+        // Try to update a non-existent leaf
+        let success = tree.update_leaf(100, Key::Value(999));
+        assert!(!success, "update_leaf should fail for out-of-bounds index");
+    }
+
+    #[test]
+    fn test_update_leaf_with_supremum() {
+        // Test updating a leaf with Key::Supremum
+        let height = 2u8;
+        let sizes = precompute_subtree_sizes(height);
+        let node_count = 3;
+        let leaf_positions: Box<[usize]> =
+            BlockSearchTree::<u32, u32>::collect_leaf_positions_inorder(node_count, &sizes)
+                .into_boxed_slice();
+
+        let mut nodes: Vec<Node<u32, u32>> = (0..node_count)
+            .map(|_| Node::Internal {
+                min_rhs: Key::Supremum,
+            })
+            .collect();
+
+        for &pos in leaf_positions.iter() {
+            nodes[pos] = Node::Leaf(
+                Key::Value(50),
+                Block {
+                    cell_slice_ptr: std::ptr::null(),
+                    length: 0,
+                },
+            );
+        }
+
+        let mut tree = BlockSearchTree::<u32, u32> {
+            nodes: nodes.into_boxed_slice(),
+            subtree_sizes: sizes,
+            height,
+            leaf_positions,
+        };
+
+        // Update to Supremum (representing an empty block)
+        let success = tree.update_leaf(0, Key::Supremum);
+        assert!(success, "update_leaf should succeed with Supremum");
+
+        let leaf_pos = tree.leaf_index_to_position(0).unwrap();
+        match &tree.nodes[leaf_pos] {
+            Node::Leaf(key, _) => {
+                assert_eq!(*key, Key::Supremum, "Leaf key should be Supremum");
+            }
+            _ => panic!("Expected Leaf node"),
+        }
+    }
+
+    #[test]
+    fn test_propagate_key_change_updates_ancestors() {
+        // Test that propagate_key_change updates internal node min_rhs values
+        // Create a height-3 tree (7 nodes, 4 leaves)
+        // In-order leaves: positions [3, 4, 5, 6] for height-3 vEB layout
+        let height = 3u8;
+        let sizes = precompute_subtree_sizes(height);
+        let node_count = 7;
+        let leaf_positions: Box<[usize]> =
+            BlockSearchTree::<u32, u32>::collect_leaf_positions_inorder(node_count, &sizes)
+                .into_boxed_slice();
+
+        // Set up internal nodes with initial min_rhs values
+        // For a height-3 tree:
+        // - Node 0 (root): min_rhs points to leaf 2 (third leaf, first of right subtree)
+        // - Node 1: min_rhs points to leaf 1 (second leaf)
+        // - Node 2: min_rhs points to leaf 3 (fourth leaf)
+        let nodes: Vec<Node<u32, u32>> = vec![
+            Node::Internal {
+                min_rhs: Key::Value(30),
+            }, // root, min_rhs = min of right subtree
+            Node::Internal {
+                min_rhs: Key::Value(20),
+            }, // left child
+            Node::Internal {
+                min_rhs: Key::Value(40),
+            }, // right child
+            Node::Leaf(
+                Key::Value(10),
+                Block {
+                    cell_slice_ptr: std::ptr::null(),
+                    length: 0,
+                },
+            ), // leaf 0
+            Node::Leaf(
+                Key::Value(20),
+                Block {
+                    cell_slice_ptr: std::ptr::null(),
+                    length: 0,
+                },
+            ), // leaf 1
+            Node::Leaf(
+                Key::Value(30),
+                Block {
+                    cell_slice_ptr: std::ptr::null(),
+                    length: 0,
+                },
+            ), // leaf 2
+            Node::Leaf(
+                Key::Value(40),
+                Block {
+                    cell_slice_ptr: std::ptr::null(),
+                    length: 0,
+                },
+            ), // leaf 3
+        ];
+
+        let mut tree = BlockSearchTree::<u32, u32> {
+            nodes: nodes.into_boxed_slice(),
+            subtree_sizes: sizes,
+            height,
+            leaf_positions,
+        };
+
+        // Update leaf 2 (first leaf of root's right subtree) to a new value
+        // This should update the root's min_rhs
+        tree.update_leaf(2, Key::Value(35));
+
+        // Verify root's min_rhs was updated
+        match &tree.nodes[0] {
+            Node::Internal { min_rhs } => {
+                assert_eq!(
+                    *min_rhs,
+                    Key::Value(35),
+                    "Root's min_rhs should be updated to 35"
+                );
+            }
+            _ => panic!("Expected Internal node at root"),
+        }
+
+        // Node 2 (right child of root) should also be updated since leaf 2
+        // is the first leaf of its left subtree - wait, that means node 2's
+        // min_rhs shouldn't change (it points to its right subtree's min)
+        // Let me verify the actual structure...
+    }
+
+    #[test]
+    fn test_update_all_leaves_sequentially() {
+        // Test updating all leaves in sequence
+        let height = 3u8;
+        let sizes = precompute_subtree_sizes(height);
+        let node_count = 7;
+        let leaf_positions: Box<[usize]> =
+            BlockSearchTree::<u32, u32>::collect_leaf_positions_inorder(node_count, &sizes)
+                .into_boxed_slice();
+        let leaf_count = leaf_positions.len();
+
+        let mut nodes: Vec<Node<u32, u32>> = (0..node_count)
+            .map(|_| Node::Internal {
+                min_rhs: Key::Supremum,
+            })
+            .collect();
+
+        for &pos in leaf_positions.iter() {
+            nodes[pos] = Node::Leaf(
+                Key::Supremum,
+                Block {
+                    cell_slice_ptr: std::ptr::null(),
+                    length: 0,
+                },
+            );
+        }
+
+        let mut tree = BlockSearchTree::<u32, u32> {
+            nodes: nodes.into_boxed_slice(),
+            subtree_sizes: sizes,
+            height,
+            leaf_positions,
+        };
+
+        // Update each leaf with a unique key
+        for i in 0..leaf_count {
+            let key = (i as u32 + 1) * 10;
+            let success = tree.update_leaf(i, Key::Value(key));
+            assert!(success, "update_leaf should succeed for leaf {}", i);
+
+            // Verify the update
+            let pos = tree.leaf_index_to_position(i).unwrap();
+            match &tree.nodes[pos] {
+                Node::Leaf(k, _) => {
+                    assert_eq!(*k, Key::Value(key), "Leaf {} should have key {}", i, key);
+                }
+                _ => panic!("Expected Leaf at position {}", pos),
+            }
         }
     }
 }

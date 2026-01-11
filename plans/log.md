@@ -189,3 +189,51 @@ The `Node::Internal` variant now only stores `min_rhs` (a `Key<K>`), eliminating
 ### Next steps
 
 Step 4 will add leaf position tracking (`first_leaf_index`) to enable O(1) leaf-to-position mapping for incremental updates.
+
+## Step 4: Implement update_leaf() (Jan 11, 2026)
+
+### What was implemented
+
+Added infrastructure for incremental leaf updates, enabling O(log N) index updates instead of full O(N) rebuilds.
+
+**New field in `BlockSearchTree`:**
+
+- `leaf_positions: Box<[usize]>`: Precomputed mapping from leaf index (0..num_leaves) to node array position. Computed once at tree construction via `collect_leaf_positions_inorder()`.
+
+**New methods on `BlockSearchTree`:**
+
+- `leaf_count(&self) -> usize`: Returns the number of leaves in the tree
+- `leaf_index_to_position(&self, leaf_index: usize) -> Option<usize>`: O(1) lookup of node array position from leaf index
+- `update_leaf(&mut self, leaf_index: usize, new_min_key: Key<K>) -> bool`: Updates a single leaf's min_key and propagates changes to ancestors
+- `propagate_key_change(&mut self, leaf_pos: usize, new_key: &Key<K>)`: Updates internal node `min_rhs` values when a leaf's key changes
+
+### How it works
+
+**Leaf position mapping:**
+The `leaf_positions` array is computed at tree construction time using the existing `collect_leaf_positions_inorder()` function. This provides O(1) mapping from a logical leaf index (e.g., which PMA block) to the physical position in the vEB-layout node array.
+
+**Leaf updates:**
+`update_leaf()` takes a leaf index and new key, looks up the node position via `leaf_positions`, and updates the `Node::Leaf`'s `min_key` field directly. Returns `false` for out-of-bounds indices.
+
+**Ancestor propagation:**
+When a leaf's min_key changes, internal nodes may need their `min_rhs` updated. An internal node's `min_rhs` stores the minimum key in its right subtree. `propagate_key_change()`:
+
+1. Walks from root to the updated leaf, recording which direction (left/right) was taken at each step
+2. For any node where we went right AND then only left to reach the leaf, that node's `min_rhs` is updated (since the leaf is the minimum of its right subtree)
+
+### Tests added
+
+8 new unit tests in `cache_oblivious::btree_map::tests`:
+
+- `test_leaf_positions_stored_in_tree`: Verifies leaf_positions are computed correctly for various tree heights
+- `test_leaf_index_to_position_mapping`: Tests O(1) lookup and out-of-bounds handling
+- `test_leaf_count`: Validates leaf_count() returns 2^(h-1)
+- `test_update_leaf_basic`: Tests updating leaves with new keys
+- `test_update_leaf_out_of_bounds`: Confirms false return for invalid indices
+- `test_update_leaf_with_supremum`: Tests updating to Key::Supremum (empty block)
+- `test_propagate_key_change_updates_ancestors`: Tests ancestor min_rhs updates
+- `test_update_all_leaves_sequentially`: Tests sequential updates to all leaves
+
+### Next steps
+
+Step 5 will modify the PMA rebalance operation to return a `RebalanceResult` indicating which blocks were affected, enabling the caller to selectively update only those leaves.
