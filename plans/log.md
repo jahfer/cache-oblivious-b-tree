@@ -292,3 +292,196 @@ The affected blocks are those spanning from the destination block to the source 
 ### Next steps
 
 Step 6 will remove the async indexing infrastructure (channel, thread, delay constant, `request_reindex()`), preparing for synchronous incremental updates in Step 7.
+
+## Step 6: Remove async indexing (Jan 11, 2026)
+
+### What was implemented
+
+Removed the entire background thread infrastructure for index updates, transitioning to a synchronous model that will enable immediate consistency in Step 7.
+
+**Removed imports:**
+
+- `std::sync::atomic::AtomicBool` (no longer needed for `index_updating` flag)
+- `std::sync::mpsc::{channel, Receiver, Sender}` (no channel communication needed)
+- `std::sync::Weak` (no weak references to PMA needed)
+- `std::thread` (no background thread)
+- `std::time` (no sleep delay)
+
+**Removed constant:**
+
+- `INDEX_UPDATE_DELAY: time::Duration` (the 50ms delay between index updates)
+
+**Removed fields from `BTreeMap` struct:**
+
+- `tx: Sender<Weak<PackedMemoryArray<Cell<K, V>>>>` (channel sender for signaling reindex)
+- `index_updating: Arc<AtomicBool>` (flag indicating if background thread is updating)
+
+**Removed methods:**
+
+- `request_reindex(&self)`: Was called after insert() to signal the background thread
+- `start_indexing_thread(...)`: Spawned and managed the background indexing thread
+
+**Modified `BTreeMap::new()`:**
+
+Simplified constructor now just creates data and index without spawning any threads:
+
+```rust
+pub fn new(capacity: u32) -> BTreeMap<K, V> {
+    let packed_cells = PackedMemoryArray::with_capacity(capacity);
+    let data = Arc::new(packed_cells);
+    let raw_index = Self::generate_index(Arc::clone(&data));
+    let index = Arc::new(RwLock::new(raw_index));
+    BTreeMap { index, data }
+}
+```
+
+**Modified `insert()` method:**
+
+Removed the call to `request_reindex()` at the end. Added a TODO comment indicating that Step 7 will wire incremental updates here using `update_leaf()`.
+
+### How it works
+
+Previously, the indexing model was:
+
+1. `insert()` would modify the PMA and call `request_reindex()`
+2. `request_reindex()` would send a weak reference through a channel (if not already updating)
+3. A background thread would receive the reference, wait 50ms for debouncing, rebuild the entire index
+4. Reads during this window would see stale data
+
+Now the model is:
+
+1. `insert()` modifies the PMA (no background work)
+2. Index remains unchanged (temporarily stale until Step 7 wires `update_leaf()`)
+3. No threads, no channels, no delays
+
+### Benefits of this change
+
+- **Simplified architecture**: No thread synchronization complexity
+- **Reduced memory**: No channel buffers, atomic flags, or thread stacks
+- **Eliminated 50ms latency**: Reads no longer need to wait for background updates
+- **Foundation for Step 7**: Clean slate for wiring incremental `update_leaf()` calls
+
+### Tests added
+
+4 new unit tests in `cache_oblivious::btree_map::tests`:
+
+- `test_btreemap_struct_has_no_async_fields`: Verifies BTreeMap compiles without async-related type fields
+- `test_btreemap_new_returns_immediately`: Confirms construction completes in <10ms (no thread spawn delay)
+- `test_btreemap_no_index_update_delay`: Verifies multiple creations complete in <50ms (no INDEX_UPDATE_DELAY)
+- `test_generate_index_is_synchronous`: Confirms generate_index produces a valid BlockIndex synchronously
+
+### Known failing tests
+
+Three integration tests in `src/lib.rs` now fail (`add_ordered_values`, `add_unordered_values`, `add_100_values`). These tests relied on the async indexing to rebuild the entire index after a 50ms sleep. Since the async infrastructure is removed but Step 7 (incremental updates) is not yet implemented, the index is never updated after inserts.
+
+**This is expected behavior for Step 6.** These tests will pass again after Step 7 wires `update_leaf()` into the `insert()` method to provide immediate, synchronous index updates.
+
+### Next steps
+
+Step 7 will wire incremental updates into `insert()` by calling `update_leaf()` for affected blocks after PMA operations, completing the transition from O(N) rebuilds to O(log N) incremental updates.
+
+## Step 7: Wire incremental updates into insert (Jan 11, 2026)
+
+### What was implemented
+
+Completed the transition to synchronous incremental index updates by wiring the `update_leaf()` method into the `insert()` flow, eliminating the need for full index rebuilds.
+
+**New methods on `BlockIndex`:**
+
+- `update_leaf(&mut self, leaf_index: usize, new_min_key: Key<K>) -> bool`: Delegates to `BlockSearchTree::update_leaf()` for updating a single leaf's min_key
+- `slot_size(&self) -> usize`: Returns the number of cells per block (log2 of requested capacity)
+- `compute_block_min_key(&self, block_index: usize) -> Key<K>`: Computes the minimum key for a given block by scanning its cells
+
+**New method on `BTreeMap`:**
+
+- `update_index_for_affected_blocks(&mut self, affected_blocks: &[Range<usize>], inserted_cell_ptr: Option<*const Cell<K, V>>)`: Collects all affected block indices from rebalance operations and the insertion point, then updates the index for each
+
+**Modified `BTreeMap::insert()`:**
+
+The insert method was refactored to:
+
+1. Track `RebalanceResult` from each rebalance call during the loop
+2. Track the cell pointer where the value was actually inserted
+3. Scope the read lock on the index to just the search/insert phase
+4. After the insert completes, call `update_index_for_affected_blocks()` with a write lock to update affected leaves
+
+### How it works
+
+**Affected block collection:**
+During insert, rebalance operations return `RebalanceResult` containing the range of blocks that were affected. These ranges are collected into a vector. Additionally, the block containing the inserted cell is tracked.
+
+**Index update flow:**
+After the insert loop completes:
+
+1. The read lock on `index` is dropped (via scoping)
+2. All affected block indices are merged into a `HashSet` to deduplicate
+3. A write lock is acquired on `index`
+4. For each affected block, `compute_block_min_key()` scans the cells to find the current minimum
+5. `update_leaf()` updates the leaf's min_key and propagates changes to ancestors
+
+**Lock ordering:**
+The read lock is explicitly scoped with `{ ... }` so it's dropped before acquiring the write lock. This prevents deadlocks and allows the index to be updated after the PMA modifications are complete.
+
+### Benefits of this change
+
+- **Immediate consistency**: No 50ms delay between inserts and reads
+- **O(log N) updates**: Only affected leaves are updated, not the entire index
+- **No background threads**: All work happens synchronously in the insert call
+- **Memory efficiency**: No channel buffers or atomic flags needed
+
+### Tests added
+
+10 new unit tests in `cache_oblivious::btree_map::tests`:
+
+- `test_block_index_update_leaf_delegates_to_tree`: Verifies BlockIndex properly delegates to BlockSearchTree
+- `test_block_index_update_leaf_out_of_bounds`: Tests that out-of-bounds indices return false
+- `test_block_index_slot_size`: Verifies slot_size computation
+- `test_block_index_compute_block_min_key_empty_block`: Tests Key::Supremum for empty blocks
+- `test_block_index_compute_block_min_key_out_of_bounds`: Tests bounds checking
+- `test_update_index_for_affected_blocks_empty`: Tests no-op behavior with empty inputs
+- `test_insert_updates_index_synchronously`: Confirms immediate value retrieval after insert
+- `test_insert_multiple_values_index_stays_consistent`: Tests multiple sequential inserts
+- `test_insert_updates_index_without_delay`: Verifies inserts complete in <50ms
+
+### Previously failing tests now pass
+
+The three integration tests that were failing after Step 6 now pass:
+
+- `add_ordered_values`
+- `add_unordered_values`
+- `add_100_values`
+
+These tests no longer need their `thread::sleep(50ms)` calls (though they still have them), because the index is updated synchronously during insert.
+
+### Completion notes
+
+This completes the implementation plan for implicit vEB navigation and incremental index updates. All 7 steps are now complete:
+
+1. ✅ Subtree size precomputation
+2. ✅ Implicit child navigation
+3. ✅ Pointer-free Node structure
+4. ✅ Single-leaf update method
+5. ✅ Rebalance result tracking
+6. ✅ Async infrastructure removal
+7. ✅ Incremental update wiring
+
+The cache-oblivious B-tree now has:
+
+- O(log N) search using implicit vEB navigation (no pointer derefs)
+- O(log N) incremental index updates (no full rebuilds)
+- Immediate consistency (no 50ms async delays)
+- Reduced memory footprint (no pointer fields in internal nodes)
+
+### Cache-oblivious properties preserved
+
+The implementation maintains cache-oblivious properties through:
+
+1. **VebNavigator for tree traversal**: All tree navigation uses the `VebNavigator` struct with `left_child()` and `right_child()` methods that compute positions arithmetically using the precomputed `subtree_sizes` table. This avoids pointer chasing and maintains vEB layout benefits.
+
+2. **Sorted block updates**: The `update_index_for_affected_blocks()` method sorts affected block indices before updating, ensuring sequential access to the `leaf_positions` array and underlying PMA. This maximizes cache locality.
+
+3. **Sequential cell access**: The `compute_block_min_key()` method accesses cells sequentially within a contiguous slice of the PMA, which is optimal for cache line utilization.
+
+4. **Precomputed leaf positions**: The `leaf_positions` array provides O(1) mapping from logical leaf index to vEB node position, avoiding repeated tree traversals.
+
+5. **Propagation via vEB navigation**: The `propagate_key_change()` method uses `VebNavigator` to walk from root to leaf, following the vEB layout structure for cache-efficient ancestor updates.

@@ -3,18 +3,13 @@ use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::fmt::{self, Debug};
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, RwLock, Weak};
-use std::thread;
-use std::time;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLock};
 
 use num_rational::{Ratio, Rational};
 
 use super::cell::{Cell, CellGuard, CellIterator, Key, Marker};
 use super::packed_memory_array::PackedMemoryArray;
-
-const INDEX_UPDATE_DELAY: time::Duration = time::Duration::from_millis(50);
 
 /// Result of a rebalance operation, indicating which blocks (leaves) were affected.
 /// This enables incremental index updates instead of full O(N) rebuilds.
@@ -48,8 +43,6 @@ impl RebalanceResult {
 pub struct BTreeMap<K: Clone + Ord, V: Clone> {
     data: Arc<PackedMemoryArray<Cell<K, V>>>,
     index: Arc<RwLock<BlockIndex<K, V>>>,
-    tx: Sender<Weak<PackedMemoryArray<Cell<K, V>>>>,
-    index_updating: Arc<AtomicBool>,
 }
 
 impl<K, V> BTreeMap<K, V>
@@ -64,16 +57,7 @@ where
         let raw_index = Self::generate_index(Arc::clone(&data));
         let index = Arc::new(RwLock::new(raw_index));
 
-        let thread_index = Arc::clone(&index);
-        let (tx, rx) = channel::<Weak<PackedMemoryArray<Cell<K, V>>>>();
-        let index_updating = Self::start_indexing_thread(thread_index, rx);
-
-        BTreeMap {
-            index,
-            data,
-            tx,
-            index_updating,
-        }
+        BTreeMap { index, data }
     }
 
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
@@ -88,85 +72,147 @@ where
     where
         K: Debug,
     {
-        let index = self.index.read().unwrap();
-        let (block, min_key) = match index.get_block_for_insert(&key) {
-            SearchResult::Block(block, min_key) => (block, min_key),
-            _ => panic!("No block found for insert of key {:?}", key),
-        };
+        // Collect affected blocks from rebalance operations
+        let mut affected_blocks: Vec<Range<usize>> = Vec::new();
+        let mut inserted_cell_ptr: Option<*const Cell<K, V>> = None;
 
-        // Todo: Clean up (abstract out CellGuard)
-        let iter = self
-            .data
-            .into_iter()
-            .skip_while(|&x| x as *const _ != block.cell_slice_ptr)
-            .map(|c| unsafe { CellGuard::from_raw(c).unwrap() });
-
-        let mut selected_cell: Option<CellGuard<K, V>> = None;
-        for mut cell_guard in iter {
-            if cell_guard.is_empty() {
-                // node says there's a cell smaller than ours, keep looking
-                if selected_cell.is_none() && min_key <= Key::Value(&key) {
-                    continue;
-                // block is empty
-                } else {
-                    selected_cell = None;
-                }
-            } else {
-                let cache = cell_guard.cache().unwrap().clone().unwrap();
-                if Key::Value(&cache.key) < Key::Value(&key) {
-                    selected_cell = Some(cell_guard);
-                    continue;
-                } else if Key::Value(&cache.key) == Key::Value(&key) {
-                    selected_cell = None;
-                } else if selected_cell.is_none() {
-                    // we didn't find any cells that were <= our key, rebalance to make room
-                    // is_smallest_key = true;
-                    self.rebalance(cell_guard.inner as *const _, true);
-                }
-            }
-
-            if let Some(cell_to_move) = &selected_cell {
-                // move cell to make room for insert
-                self.rebalance(cell_to_move.inner, true);
-            }
-
-            let marker_version = cell_guard.cache_version + 1;
-            let cell = selected_cell.as_mut().unwrap_or(&mut cell_guard);
-
-            let marker = Marker::InsertCell(marker_version, key.clone(), value.clone());
-
-            let result = cell.update(marker);
-
-            if result.is_err() {
-                // Marker has been updated by another process, start loop over
-                continue;
-            }
-
-            let prev_marker = result.unwrap();
-
-            // We now have exclusive access to the cell until we update `version`.
-            // This works well for mutating through UnsafeCell<T>, but isn't really
-            // "lock-free"...
-            unsafe {
-                cell.inner.key.get().write(Some(key));
-                cell.inner.value.get().write(Some(value));
+        {
+            let index = self.index.read().unwrap();
+            let (block, min_key) = match index.get_block_for_insert(&key) {
+                SearchResult::Block(block, min_key) => (block, min_key),
+                _ => panic!("No block found for insert of key {:?}", key),
             };
 
-            let next_version = marker_version + 1;
+            // Todo: Clean up (abstract out CellGuard)
+            let iter = self
+                .data
+                .into_iter()
+                .skip_while(|&x| x as *const _ != block.cell_slice_ptr)
+                .map(|c| unsafe { CellGuard::from_raw(c).unwrap() });
 
-            // Reuse previous marker allocation
-            unsafe { prev_marker.write(Marker::Empty(next_version)) };
-            cell.inner
-                .marker
-                .as_ref()
-                .unwrap()
-                .swap(prev_marker, Ordering::SeqCst);
-            cell.inner.version.swap(next_version, Ordering::SeqCst);
+            let mut selected_cell: Option<CellGuard<K, V>> = None;
+            for mut cell_guard in iter {
+                if cell_guard.is_empty() {
+                    // node says there's a cell smaller than ours, keep looking
+                    if selected_cell.is_none() && min_key <= Key::Value(&key) {
+                        continue;
+                    // block is empty
+                    } else {
+                        selected_cell = None;
+                    }
+                } else {
+                    let cache = cell_guard.cache().unwrap().clone().unwrap();
+                    if Key::Value(&cache.key) < Key::Value(&key) {
+                        selected_cell = Some(cell_guard);
+                        continue;
+                    } else if Key::Value(&cache.key) == Key::Value(&key) {
+                        selected_cell = None;
+                    } else if selected_cell.is_none() {
+                        // we didn't find any cells that were <= our key, rebalance to make room
+                        // is_smallest_key = true;
+                        let result = self.rebalance(cell_guard.inner as *const _, true);
+                        if result.has_affected_blocks() {
+                            affected_blocks.push(result.affected_blocks);
+                        }
+                    }
+                }
 
-            break;
+                if let Some(cell_to_move) = &selected_cell {
+                    // move cell to make room for insert
+                    let result = self.rebalance(cell_to_move.inner, true);
+                    if result.has_affected_blocks() {
+                        affected_blocks.push(result.affected_blocks);
+                    }
+                }
+
+                let marker_version = cell_guard.cache_version + 1;
+                let cell = selected_cell.as_mut().unwrap_or(&mut cell_guard);
+
+                let marker = Marker::InsertCell(marker_version, key.clone(), value.clone());
+
+                let result = cell.update(marker);
+
+                if result.is_err() {
+                    // Marker has been updated by another process, start loop over
+                    continue;
+                }
+
+                let prev_marker = result.unwrap();
+
+                // We now have exclusive access to the cell until we update `version`.
+                // This works well for mutating through UnsafeCell<T>, but isn't really
+                // "lock-free"...
+                unsafe {
+                    cell.inner.key.get().write(Some(key));
+                    cell.inner.value.get().write(Some(value));
+                };
+
+                // Track the cell where we inserted for index update
+                inserted_cell_ptr = Some(cell.inner as *const Cell<K, V>);
+
+                let next_version = marker_version + 1;
+
+                // Reuse previous marker allocation
+                unsafe { prev_marker.write(Marker::Empty(next_version)) };
+                cell.inner
+                    .marker
+                    .as_ref()
+                    .unwrap()
+                    .swap(prev_marker, Ordering::SeqCst);
+                cell.inner.version.swap(next_version, Ordering::SeqCst);
+
+                break;
+            }
+        } // Read lock on index is dropped here
+
+        // Update the index for affected blocks
+        self.update_index_for_affected_blocks(&affected_blocks, inserted_cell_ptr);
+    }
+
+    /// Updates the index for blocks affected by rebalance operations and the insertion.
+    ///
+    /// For cache-oblivious efficiency, blocks are updated in sorted order (by leaf index)
+    /// to maximize memory locality when accessing the vEB-layout tree.
+    fn update_index_for_affected_blocks(
+        &mut self,
+        affected_blocks: &[Range<usize>],
+        inserted_cell_ptr: Option<*const Cell<K, V>>,
+    ) {
+        // Collect affected block indices into a sorted vector for cache-friendly access
+        let mut blocks_to_update: Vec<usize> = Vec::new();
+
+        for range in affected_blocks {
+            for block_idx in range.clone() {
+                blocks_to_update.push(block_idx);
+            }
         }
 
-        self.request_reindex();
+        // Also update the block where we inserted
+        if let Some(ptr) = inserted_cell_ptr {
+            if let Some(block_idx) = self.cell_ptr_to_block_index(ptr) {
+                blocks_to_update.push(block_idx);
+            }
+        }
+
+        // Skip if no blocks to update
+        if blocks_to_update.is_empty() {
+            return;
+        }
+
+        // Sort and deduplicate leaf indices for cache-friendly sequential access.
+        // Note: We're sorting logical leaf indices (0, 1, 2, ...), not moving any cells
+        // or nodes. The leaf_positions array in BlockSearchTree maps these indices to
+        // actual node positions in the vEB layout. Sorting ensures we access the PMA
+        // in sequential order when computing min_keys, maximizing cache locality.
+        blocks_to_update.sort_unstable();
+        blocks_to_update.dedup();
+
+        // Acquire write lock and update each affected block in sorted order
+        let mut index = self.index.write().unwrap();
+        for block_idx in blocks_to_update {
+            let new_min_key = index.compute_block_min_key(block_idx);
+            index.update_leaf(block_idx, new_min_key);
+        }
     }
 
     pub fn generate_index(data: Arc<PackedMemoryArray<Cell<K, V>>>) -> BlockIndex<K, V> {
@@ -174,48 +220,6 @@ where
             map: Arc::clone(&data),
             index_tree: BlockSearchTree::new(data),
         }
-    }
-
-    fn request_reindex(&self) {
-        // debounce
-        if !self.index_updating.load(Ordering::Acquire) {
-            let _ = self.tx.send(Arc::downgrade(&self.data));
-        }
-    }
-
-    fn start_indexing_thread(
-        index: Arc<RwLock<BlockIndex<K, V>>>,
-        rx: Receiver<Weak<PackedMemoryArray<Cell<K, V>>>>,
-    ) -> Arc<AtomicBool> {
-        let is_updating = Arc::new(AtomicBool::new(false));
-        let thread_is_updating = Arc::clone(&is_updating);
-        thread::spawn(move || {
-            loop {
-                let result = rx
-                    .recv()
-                    .ok()
-                    .map(|x| {
-                        thread_is_updating.store(true, Ordering::Release);
-                        x
-                    })
-                    .and_then(|cells_ptr| cells_ptr.upgrade())
-                    .map(|cells| {
-                        let new_index = Self::generate_index(cells);
-                        let mut i = index.write().unwrap();
-                        // todo is the memory barrier in the right place here, relative to the index generation?
-                        thread_is_updating.store(false, Ordering::Release);
-                        *i = new_index;
-                    });
-
-                if let None = result {
-                    break;
-                }
-
-                thread::sleep(INDEX_UPDATE_DELAY);
-            }
-        });
-
-        is_updating
     }
 
     fn rebalance(&self, cell_ptr_start: *const Cell<K, V>, for_insertion: bool) -> RebalanceResult {
@@ -492,6 +496,51 @@ where
                 None
             }
         }
+    }
+
+    /// Updates a leaf's min_key for incremental index maintenance.
+    ///
+    /// # Arguments
+    /// * `leaf_index` - The leaf index (0..num_leaves) to update
+    /// * `new_min_key` - The new minimum key for this leaf
+    ///
+    /// # Returns
+    /// `true` if the update was successful, `false` if leaf_index is out of bounds.
+    fn update_leaf(&mut self, leaf_index: usize, new_min_key: Key<K>) -> bool {
+        self.index_tree.update_leaf(leaf_index, new_min_key)
+    }
+
+    /// Returns the slot size (number of cells per block/leaf).
+    fn slot_size(&self) -> usize {
+        self.map.requested_capacity.ilog2() as usize
+    }
+
+    /// Computes the minimum key for a given block index.
+    ///
+    /// Reads the cells in the block and returns the key of the first non-empty cell,
+    /// or Key::Supremum if all cells are empty.
+    fn compute_block_min_key(&self, block_index: usize) -> Key<K> {
+        let slot_size = self.slot_size();
+        let start_offset = block_index * slot_size;
+        let cells = self.map.as_slice();
+
+        // Check bounds
+        if start_offset >= cells.len() {
+            return Key::Supremum;
+        }
+
+        let end_offset = (start_offset + slot_size).min(cells.len());
+        let block_cells = &cells[start_offset..end_offset];
+
+        // Find the first non-empty cell (cells are sorted within a block)
+        for cell in block_cells {
+            let key_opt = unsafe { (*cell.key.get()).as_ref() };
+            if let Some(k) = key_opt {
+                return Key::Value(k.clone());
+            }
+        }
+
+        Key::Supremum
     }
 }
 
@@ -1969,5 +2018,160 @@ mod tests {
         let original = RebalanceResult::new(5..10);
         let cloned = original.clone();
         assert_eq!(original, cloned);
+    }
+
+    // === Step 7 tests: Incremental index updates wired into insert ===
+
+    #[test]
+    fn test_block_index_update_leaf_delegates_to_tree() {
+        // Test that BlockIndex::update_leaf properly delegates to BlockSearchTree
+        let capacity = 16u32;
+        let pma = PackedMemoryArray::<Cell<u32, u32>>::with_capacity(capacity);
+        let data = Arc::new(pma);
+
+        let mut index = BTreeMap::generate_index(Arc::clone(&data));
+
+        // The tree should have leaves, try to update one
+        let leaf_count = index.index_tree.leaf_count();
+        if leaf_count > 0 {
+            let success = index.update_leaf(0, Key::Value(42));
+            assert!(success, "update_leaf should succeed for valid leaf index");
+
+            // Verify the update took effect
+            let pos = index.index_tree.leaf_index_to_position(0).unwrap();
+            match &index.index_tree.nodes[pos] {
+                Node::Leaf(k, _) => {
+                    assert_eq!(*k, Key::Value(42), "Leaf should have updated key");
+                }
+                _ => panic!("Expected Leaf node"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_block_index_update_leaf_out_of_bounds() {
+        let capacity = 16u32;
+        let pma = PackedMemoryArray::<Cell<u32, u32>>::with_capacity(capacity);
+        let data = Arc::new(pma);
+
+        let mut index = BTreeMap::generate_index(Arc::clone(&data));
+
+        // Try to update a leaf that doesn't exist
+        let success = index.update_leaf(9999, Key::Value(42));
+        assert!(!success, "update_leaf should fail for out-of-bounds index");
+    }
+
+    #[test]
+    fn test_block_index_slot_size() {
+        let capacity = 16u32;
+        let pma = PackedMemoryArray::<Cell<u32, u32>>::with_capacity(capacity);
+        let data = Arc::new(pma);
+
+        let index = BTreeMap::generate_index(Arc::clone(&data));
+
+        // slot_size = log2(requested_capacity) = log2(16) = 4
+        assert_eq!(index.slot_size(), 4);
+    }
+
+    #[test]
+    fn test_block_index_compute_block_min_key_empty_block() {
+        let capacity = 16u32;
+        let pma = PackedMemoryArray::<Cell<u32, u32>>::with_capacity(capacity);
+        let data = Arc::new(pma);
+
+        let index = BTreeMap::generate_index(Arc::clone(&data));
+
+        // Empty PMA should have Key::Supremum for all blocks
+        let min_key = index.compute_block_min_key(0);
+        assert_eq!(min_key, Key::Supremum);
+    }
+
+    #[test]
+    fn test_block_index_compute_block_min_key_out_of_bounds() {
+        let capacity = 16u32;
+        let pma = PackedMemoryArray::<Cell<u32, u32>>::with_capacity(capacity);
+        let data = Arc::new(pma);
+
+        let index = BTreeMap::generate_index(Arc::clone(&data));
+
+        // Block index way out of bounds should return Supremum
+        let min_key = index.compute_block_min_key(9999);
+        assert_eq!(min_key, Key::Supremum);
+    }
+
+    #[test]
+    fn test_update_index_for_affected_blocks_empty() {
+        // When there are no affected blocks, update should be a no-op
+        let mut btree: BTreeMap<u32, u32> = BTreeMap::new(16);
+
+        // Call with empty vectors - should not panic
+        btree.update_index_for_affected_blocks(&[], None);
+    }
+
+    #[test]
+    fn test_insert_updates_index_synchronously() {
+        // Test that insert immediately updates the index (no 50ms delay)
+        let mut btree: BTreeMap<u32, u32> = BTreeMap::new(16);
+
+        // Insert a value
+        btree.insert(10, 100);
+
+        // Immediately check if we can get the value back
+        // This tests that the index was updated synchronously
+        let result = btree.get(&10);
+        assert_eq!(
+            result,
+            Some(&100),
+            "Value should be retrievable immediately after insert"
+        );
+    }
+
+    #[test]
+    fn test_insert_multiple_values_index_stays_consistent() {
+        // Test that multiple inserts maintain a consistent index
+        // Use a small capacity similar to the working integration tests
+        let mut btree: BTreeMap<u8, u8> = BTreeMap::new(16);
+
+        // Insert several values (ascending order first to match add_ordered_values pattern)
+        btree.insert(3, 30);
+        btree.insert(8, 80);
+        btree.insert(12, 120);
+
+        // All values should be retrievable immediately
+        assert_eq!(btree.get(&3), Some(&30));
+        assert_eq!(btree.get(&8), Some(&80));
+        assert_eq!(btree.get(&12), Some(&120));
+
+        // Non-existent key should return None
+        assert_eq!(btree.get(&7), None);
+    }
+
+    #[test]
+    fn test_insert_updates_index_without_delay() {
+        // Verify that inserts complete quickly (no INDEX_UPDATE_DELAY)
+        use std::time::Instant;
+
+        let start = Instant::now();
+        let mut btree: BTreeMap<u32, u32> = BTreeMap::new(16);
+
+        // Insert a few values
+        for i in 0..5 {
+            btree.insert(i, i * 10);
+        }
+
+        let elapsed = start.elapsed();
+
+        // Should complete much faster than the old 50ms delay per insert
+        // Allow generous margin for slow CI systems, but it should definitely be < 50ms
+        assert!(
+            elapsed.as_millis() < 50,
+            "Inserts should complete quickly without INDEX_UPDATE_DELAY, took {}ms",
+            elapsed.as_millis()
+        );
+
+        // Verify all values are retrievable
+        for i in 0..5 {
+            assert_eq!(btree.get(&i), Some(&(i * 10)));
+        }
     }
 }

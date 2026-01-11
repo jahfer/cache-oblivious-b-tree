@@ -204,9 +204,9 @@ impl<K, V> BTreeMap<K, V> {
 
 5. **[x] Modify PMA rebalance to return affected range** — Return `RebalanceResult` indicating which blocks shifted
 
-6. **[ ] Remove async indexing** — Delete channel, thread, delay constant, `request_reindex()`
+6. **[x] Remove async indexing** — Delete channel, thread, delay constant, `request_reindex()`
 
-7. **[ ] Wire incremental updates into insert** — After PMA operations, call `update_leaf()` for affected blocks
+7. **[x] Wire incremental updates into insert** — After PMA operations, call `update_leaf()` for affected blocks
 
 ## Complexity Analysis
 
