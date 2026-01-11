@@ -3,9 +3,8 @@ use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
 use std::collections::BTreeMap;
 use std::hint::black_box;
 
-/// Dataset sizes to test - constrained by current PMA allocation limits
-/// TODO: Increase sizes once allocation_size() overflow is fixed for large capacities
-const SIZES: &[u32] = &[100, 500, 1_000, 2_000];
+/// Dataset sizes to test - now supports larger sizes after allocation_size() overflow fix
+const SIZES: &[usize] = &[100, 500, 1_000, 2_000, 5_000, 10_000, 50_000, 100_000];
 
 /// Simple LCG for deterministic "random" access patterns without external deps
 struct SimpleRng {
@@ -17,10 +16,10 @@ impl SimpleRng {
         Self { state: seed }
     }
 
-    fn next_u32(&mut self, max: u32) -> u32 {
+    fn next_usize(&mut self, max: usize) -> usize {
         // LCG parameters from Numerical Recipes
         self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        ((self.state >> 33) as u32) % max
+        ((self.state >> 33) as usize) % max
     }
 }
 
@@ -44,7 +43,7 @@ fn bench_point_lookup(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("COBTree", size), &size, |b, &size| {
             let mut rng = SimpleRng::new(42);
             b.iter(|| {
-                let key = rng.next_u32(size);
+                let key = rng.next_usize(size);
                 black_box(co_map.get(&key))
             })
         });
@@ -52,7 +51,7 @@ fn bench_point_lookup(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("BTreeMap", size), &size, |b, &size| {
             let mut rng = SimpleRng::new(42);
             b.iter(|| {
-                let key = rng.next_u32(size);
+                let key = rng.next_usize(size);
                 black_box(std_map.get(&key))
             })
         });
@@ -104,7 +103,7 @@ fn bench_random_insert(c: &mut Criterion) {
                 let mut map = COBTreeMap::new(size);
                 let mut rng = SimpleRng::new(12345);
                 for _ in 0..size {
-                    let key = rng.next_u32(size * 10); // sparse keys
+                    let key = rng.next_usize(size * 10); // sparse keys
                     map.insert(key, black_box(key));
                 }
                 black_box(&map);
@@ -116,7 +115,7 @@ fn bench_random_insert(c: &mut Criterion) {
                 let mut map = BTreeMap::new();
                 let mut rng = SimpleRng::new(12345);
                 for _ in 0..size {
-                    let key = rng.next_u32(size * 10);
+                    let key = rng.next_usize(size * 10);
                     map.insert(key, black_box(key));
                 }
                 black_box(&map);
@@ -131,8 +130,8 @@ fn bench_random_insert(c: &mut Criterion) {
 /// Accessing every Nth element is particularly punishing for cache-unfriendly layouts.
 fn bench_strided_access(c: &mut Criterion) {
     let mut group = c.benchmark_group("Strided Access");
-    let size: u32 = 2_000;
-    let stride: u32 = 127; // prime stride to avoid alignment patterns
+    let size: usize = 2_000;
+    let stride: usize = 127; // prime stride to avoid alignment patterns
 
     // Pre-populate
     let mut std_map = BTreeMap::new();
@@ -148,7 +147,7 @@ fn bench_strided_access(c: &mut Criterion) {
 
     group.bench_function("COBTree", |b| {
         b.iter(|| {
-            let mut key = 0u32;
+            let mut key = 0usize;
             for _ in 0..num_accesses {
                 black_box(co_map.get(&key));
                 key = (key + stride) % size;
@@ -158,7 +157,7 @@ fn bench_strided_access(c: &mut Criterion) {
 
     group.bench_function("BTreeMap", |b| {
         b.iter(|| {
-            let mut key = 0u32;
+            let mut key = 0usize;
             for _ in 0..num_accesses {
                 black_box(std_map.get(&key));
                 key = (key + stride) % size;
@@ -174,7 +173,7 @@ fn bench_strided_access(c: &mut Criterion) {
 fn bench_mixed_workload(c: &mut Criterion) {
     let mut group = c.benchmark_group("Mixed Workload (80R/20W)");
 
-    for &size in &[500u32, 1_000, 2_000] {
+    for &size in &[500usize, 1_000, 2_000] {
         // Pre-populate with half the keys
         let mut std_map = BTreeMap::new();
         let mut co_map = COBTreeMap::new(size);
@@ -184,15 +183,15 @@ fn bench_mixed_workload(c: &mut Criterion) {
             co_map.insert(i, i);
         }
 
-        let ops = 1000u32;
+        let ops = 1000usize;
         group.throughput(Throughput::Elements(ops as u64));
 
         group.bench_with_input(BenchmarkId::new("COBTree", size), &size, |b, &size| {
             let mut rng = SimpleRng::new(999);
             b.iter(|| {
                 for _ in 0..ops {
-                    let key = rng.next_u32(size);
-                    if rng.next_u32(100) < 80 {
+                    let key = rng.next_usize(size);
+                    if rng.next_usize(100) < 80 {
                         // 80% read
                         black_box(co_map.get(&key));
                     } else {
@@ -207,8 +206,8 @@ fn bench_mixed_workload(c: &mut Criterion) {
             let mut rng = SimpleRng::new(999);
             b.iter(|| {
                 for _ in 0..ops {
-                    let key = rng.next_u32(size);
-                    if rng.next_u32(100) < 80 {
+                    let key = rng.next_usize(size);
+                    if rng.next_usize(100) < 80 {
                         black_box(std_map.get(&key));
                     } else {
                         std_map.insert(key, black_box(key));
@@ -224,8 +223,8 @@ fn bench_mixed_workload(c: &mut Criterion) {
 /// Benchmark bulk loading followed by lookups - common initialization pattern.
 fn bench_bulk_load_then_query(c: &mut Criterion) {
     let mut group = c.benchmark_group("Bulk Load + Query");
-    let size: u32 = 50_000;
-    let queries = 10_000u32;
+    let size: usize = 50_000;
+    let queries = 10_000usize;
 
     group.throughput(Throughput::Elements((size + queries) as u64));
 
@@ -239,7 +238,7 @@ fn bench_bulk_load_then_query(c: &mut Criterion) {
             // Query phase
             let mut rng = SimpleRng::new(777);
             for _ in 0..queries {
-                let key = rng.next_u32(size);
+                let key = rng.next_usize(size);
                 black_box(map.get(&key));
             }
         })
@@ -253,7 +252,7 @@ fn bench_bulk_load_then_query(c: &mut Criterion) {
             }
             let mut rng = SimpleRng::new(777);
             for _ in 0..queries {
-                let key = rng.next_u32(size);
+                let key = rng.next_usize(size);
                 black_box(map.get(&key));
             }
         })

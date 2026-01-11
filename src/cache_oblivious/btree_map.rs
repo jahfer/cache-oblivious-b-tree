@@ -50,7 +50,7 @@ where
     K: 'static + Clone + Ord,
     V: 'static + Clone,
 {
-    pub fn new(capacity: u32) -> BTreeMap<K, V> {
+    pub fn new(capacity: usize) -> BTreeMap<K, V> {
         let packed_cells = PackedMemoryArray::with_capacity(capacity);
         let data = Arc::new(packed_cells);
 
@@ -2025,7 +2025,7 @@ mod tests {
     #[test]
     fn test_block_index_update_leaf_delegates_to_tree() {
         // Test that BlockIndex::update_leaf properly delegates to BlockSearchTree
-        let capacity = 16u32;
+        let capacity = 16usize;
         let pma = PackedMemoryArray::<Cell<u32, u32>>::with_capacity(capacity);
         let data = Arc::new(pma);
 
@@ -2050,7 +2050,7 @@ mod tests {
 
     #[test]
     fn test_block_index_update_leaf_out_of_bounds() {
-        let capacity = 16u32;
+        let capacity = 16usize;
         let pma = PackedMemoryArray::<Cell<u32, u32>>::with_capacity(capacity);
         let data = Arc::new(pma);
 
@@ -2063,7 +2063,7 @@ mod tests {
 
     #[test]
     fn test_block_index_slot_size() {
-        let capacity = 16u32;
+        let capacity = 16usize;
         let pma = PackedMemoryArray::<Cell<u32, u32>>::with_capacity(capacity);
         let data = Arc::new(pma);
 
@@ -2075,7 +2075,7 @@ mod tests {
 
     #[test]
     fn test_block_index_compute_block_min_key_empty_block() {
-        let capacity = 16u32;
+        let capacity = 16usize;
         let pma = PackedMemoryArray::<Cell<u32, u32>>::with_capacity(capacity);
         let data = Arc::new(pma);
 
@@ -2088,7 +2088,7 @@ mod tests {
 
     #[test]
     fn test_block_index_compute_block_min_key_out_of_bounds() {
-        let capacity = 16u32;
+        let capacity = 16usize;
         let pma = PackedMemoryArray::<Cell<u32, u32>>::with_capacity(capacity);
         let data = Arc::new(pma);
 

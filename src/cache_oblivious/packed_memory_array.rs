@@ -9,7 +9,7 @@ pub struct PackedMemoryArray<T> {
   cells: Pin<Box<[T]>>,
   pub config: Config,
   pub active_range: Range<*const T>,
-  pub requested_capacity: u32, // todo: Temporary...
+  pub requested_capacity: usize,
   _pin: PhantomPinned
 }
 
@@ -17,7 +17,7 @@ unsafe impl <T> Send for PackedMemoryArray<T> {}
 unsafe impl <T> Sync for PackedMemoryArray<T> {}
 
 impl <T> PackedMemoryArray<T> {
-  pub fn new(cells: Box<[T]>, capacity: u32) -> PackedMemoryArray<T> {
+  pub fn new(cells: Box<[T]>, capacity: usize) -> PackedMemoryArray<T> {
     let left_buffer_space = cells.len() >> 2;
 
     // TODO: Generalize this
@@ -77,7 +77,7 @@ impl <T> PackedMemoryArray<T> {
       .collect::<Vec<_>>()
   }
 
-  fn allocation_size(num_keys: u32) -> u32 {
+  fn allocation_size(num_keys: usize) -> usize {
     let t_min = 0.5;
     let p_max = 0.25;
     let ideal_density = (t_min - p_max) / 2f32;
@@ -85,16 +85,26 @@ impl <T> PackedMemoryArray<T> {
     let length = num_keys as f32 / ideal_density;
     // To get a balanced tree, we need to find the
     // closest double-exponential number (x = 2^2^i)
-    let clean_length = 2 << ((f32::log2(length).ceil() as u32).next_power_of_two() - 1);
-    clean_length
+    // The exponent must be a power of two: 2^1=2, 2^2=4, 2^4=16, 2^8=256, 2^16=65536, 2^32=4294967296
+    let exponent = (f32::log2(length).ceil() as usize).next_power_of_two();
+    
+    // Check for overflow: on 64-bit, max exponent is 63; on 32-bit, max is 31
+    assert!(
+      exponent <= usize::BITS as usize - 1,
+      "PMA allocation size overflow: requested capacity {} requires 2^{} cells, which exceeds maximum allocatable size",
+      num_keys,
+      exponent
+    );
+    
+    1usize << exponent
   }
 }
 
 impl <T> PackedMemoryArray<T> where T: Default {
-  pub fn with_capacity(capacity: u32) -> PackedMemoryArray<T> {
+  pub fn with_capacity(capacity: usize) -> PackedMemoryArray<T> {
     let size = Self::allocation_size(capacity);
     // println!("packed memory array [V; {:?}]", size);
-    let initialized_cells = Self::allocate_default(size as usize);
+    let initialized_cells = Self::allocate_default(size);
     PackedMemoryArray::new(initialized_cells, capacity)
   }
 
@@ -165,4 +175,78 @@ pub struct Config {
 pub struct Density {
   pub max_item_count: usize,
   pub range: RangeInclusive<Rational>,
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Helper to test allocation_size without needing a full PackedMemoryArray
+  fn test_allocation_size(num_keys: usize) -> usize {
+    PackedMemoryArray::<()>::allocation_size(num_keys)
+  }
+
+  #[test]
+  fn allocation_size_small_capacities() {
+    // Small capacities should produce valid double-exponential sizes
+    // With ideal_density = 0.125, length = num_keys / 0.125 = num_keys * 8
+    assert_eq!(test_allocation_size(1), 16);   // 2^4 (length=8, ceil(log2(8))=3, next_pow2=4)
+    assert_eq!(test_allocation_size(2), 16);   // 2^4 (length=16, ceil(log2(16))=4, next_pow2=4)
+    assert_eq!(test_allocation_size(16), 256); // 2^8 (length=128, ceil(log2(128))=7, next_pow2=8)
+  }
+
+  #[test]
+  fn allocation_size_medium_capacities() {
+    // Medium capacities - note the formula produces larger sizes due to ideal density
+    // 100 keys -> length=800 -> log2(800)≈9.6 -> ceil=10 -> next_pow2=16 -> 2^16
+    assert_eq!(test_allocation_size(100), 65536);   // 2^16
+    assert_eq!(test_allocation_size(5000), 65536);  // 2^16 (length=40000, log2≈15.3, next_pow2=16)
+  }
+
+  #[test]
+  fn allocation_size_large_capacities() {
+    // Large capacities that require 64-bit arithmetic
+    // 10000 keys -> length=80000 -> log2≈16.3 -> ceil=17 -> next_pow2=32 -> 2^32
+    assert_eq!(test_allocation_size(10_000), 4294967296);  // 2^32
+    assert_eq!(test_allocation_size(100_000), 4294967296); // 2^32
+  }
+
+  #[test]
+  fn allocation_size_follows_double_exponential_sequence() {
+    // Verify the double-exponential sequence: 2^1, 2^2, 2^4, 2^8, 2^16, 2^32
+    // Each result should be a power of 2 where the exponent is also a power of 2
+    let valid_sizes: Vec<usize> = vec![2, 4, 16, 256, 65536, 4294967296];
+    
+    for cap in [1, 10, 100, 1000, 10000, 100000] {
+      let size = test_allocation_size(cap);
+      assert!(
+        valid_sizes.contains(&size),
+        "allocation_size({}) = {} is not a valid double-exponential size",
+        cap,
+        size
+      );
+    }
+  }
+
+  #[test]
+  fn packed_memory_array_with_capacity_small() {
+    let pma: PackedMemoryArray<i32> = PackedMemoryArray::with_capacity(16);
+    assert!(pma.len() > 0);
+    assert_eq!(pma.requested_capacity, 16);
+  }
+
+  #[test]
+  fn packed_memory_array_with_capacity_medium() {
+    let pma: PackedMemoryArray<i32> = PackedMemoryArray::with_capacity(5000);
+    assert!(pma.len() >= 5000);
+    assert_eq!(pma.requested_capacity, 5000);
+  }
+
+  #[test]
+  fn packed_memory_array_with_capacity_large() {
+    // This previously would overflow with u32
+    let pma: PackedMemoryArray<i32> = PackedMemoryArray::with_capacity(10000);
+    assert!(pma.len() >= 10000);
+    assert_eq!(pma.requested_capacity, 10000);
+  }
 }
