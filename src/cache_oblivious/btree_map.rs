@@ -271,7 +271,7 @@ where
       if prev_marker.is_err() {
         // Marker has been updated by another process.
         // Deallocate memory, start loop over.
-        unsafe { Box::from_raw(new_marker_raw) };
+        unsafe { drop(Box::from_raw(new_marker_raw)) };
         todo!("Restart rebalance!");
       }
 
@@ -565,7 +565,7 @@ where
     };
   }
 
-  fn root(&'a self) -> &Node<K, V> {
+  fn root(&'a self) -> &'a Node<K, V> {
     unsafe { &*self.nodes[0].get() }
   }
 

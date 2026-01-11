@@ -4,8 +4,9 @@ use std::fmt::{self, Debug, Display};
 use std::marker::PhantomData;
 use std::error::Error;
 use std::sync::atomic::{AtomicPtr, AtomicU16, Ordering as AtomicOrdering};
-use std::lazy::OnceCell;
+use std::cell::OnceCell;
 
+#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, PartialOrd, Clone, Copy)]
 pub enum Key<T: Ord> {
   Infimum,
@@ -29,6 +30,7 @@ impl <'a, T: Ord> Key<T> {
     }
   }
 
+  #[allow(dead_code)]
   pub fn is_infimum(&self) -> bool {
     match self {
       Key::Infimum => true,
@@ -113,7 +115,7 @@ impl<K: Clone, V: Clone> Drop for Cell<K, V> {
   fn drop(&mut self) {
     let ptr = self.marker.take().unwrap();
     let marker = ptr.load(AtomicOrdering::Acquire);
-    unsafe { Box::from_raw(marker) };
+    unsafe { drop(Box::from_raw(marker)) };
   }
 }
 
@@ -158,29 +160,36 @@ impl <K: Clone, V: Clone> CellGuard<'_, K, V> {
   }
 
   pub fn cache(&self) -> Result<&Option<CellData<K, V>>, CellReadError> {
-    self.cache_data.get_or_try_init(|| {
-      let version = self.inner.version.load(AtomicOrdering::SeqCst);
-      let key = unsafe { (*self.inner.key.get()).clone() };
+    // Manual implementation of get_or_try_init for stable Rust
+    if let Some(cached) = self.cache_data.get() {
+      return Ok(cached);
+    }
 
-      let value = if key.is_some() {
-        unsafe { (*self.inner.value.get()).clone() }
-      } else {
-        None
-      };
-      let current_marker_raw = self.inner.marker.as_ref().unwrap().load(AtomicOrdering::SeqCst);
-      let marker = unsafe { (*current_marker_raw).clone() };
+    let version = self.inner.version.load(AtomicOrdering::SeqCst);
+    let key = unsafe { (*self.inner.key.get()).clone() };
 
-      if version != *marker.version() {
-        return Result::Err(CellReadError {});
-        // todo "Read marker, perform action there, reload data"
-      }
-      
-      if key.is_some() {
-        Ok(Some(CellData { key: key.unwrap(), value: value.unwrap(), marker }))
-      } else {
-        Ok(None)
-      }
-    })
+    let value = if key.is_some() {
+      unsafe { (*self.inner.value.get()).clone() }
+    } else {
+      None
+    };
+    let current_marker_raw = self.inner.marker.as_ref().unwrap().load(AtomicOrdering::SeqCst);
+    let marker = unsafe { (*current_marker_raw).clone() };
+
+    if version != *marker.version() {
+      return Result::Err(CellReadError {});
+      // todo "Read marker, perform action there, reload data"
+    }
+    
+    let result = if key.is_some() {
+      Some(CellData { key: key.unwrap(), value: value.unwrap(), marker })
+    } else {
+      None
+    };
+
+    // set() will fail if already set (race condition), but get() will return the value
+    let _ = self.cache_data.set(result);
+    Ok(self.cache_data.get().unwrap())
   }
 
   pub fn update(&mut self, marker: Marker<K, V>) -> Result<*mut Marker<K,V>, Box<dyn Error>> {
@@ -195,7 +204,7 @@ impl <K: Clone, V: Clone> CellGuard<'_, K, V> {
 
     if result.is_err() {
       // Deallocate memory, try again next time
-      unsafe { Box::from_raw(new_marker_raw) };
+      unsafe { drop(Box::from_raw(new_marker_raw)) };
       // Marker has been updated by another process, start loop over
       return Err(Box::new(CellWriteError {}))
     } else {
