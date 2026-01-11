@@ -430,6 +430,136 @@ struct SubtreeSizes {
     lower_size: usize,
 }
 
+/// Tracks navigation state within the vEB-layout tree.
+/// This enables implicit child position computation without explicit pointers.
+#[derive(Debug, Clone, Copy)]
+struct VebNavigator {
+    /// Current position in the flattened node array.
+    position: usize,
+    /// Base offset of the current vEB subtree in the node array.
+    subtree_base: usize,
+    /// Current depth within the vEB recursion (index into subtree_sizes).
+    veb_depth: usize,
+    /// Position within the current upper subtree (0-indexed from subtree's root).
+    local_position: usize,
+    /// Size of the current subtree (used for bounds checking at deepest level).
+    current_subtree_size: usize,
+}
+
+impl VebNavigator {
+    /// Creates a navigator starting at the root of the tree.
+    fn at_root(tree_size: usize) -> Self {
+        VebNavigator {
+            position: 0,
+            subtree_base: 0,
+            veb_depth: 0,
+            local_position: 0,
+            current_subtree_size: tree_size,
+        }
+    }
+
+    /// Computes the position of the left child and returns a new navigator for it.
+    ///
+    /// # Arguments
+    /// * `subtree_sizes` - The precomputed subtree sizes for vEB navigation
+    ///
+    /// # Returns
+    /// A new `VebNavigator` pointing to the left child position.
+    fn left_child(&self, subtree_sizes: &[SubtreeSizes]) -> VebNavigator {
+        self.child(subtree_sizes, false)
+    }
+
+    /// Computes the position of the right child and returns a new navigator for it.
+    ///
+    /// # Arguments
+    /// * `subtree_sizes` - The precomputed subtree sizes for vEB navigation
+    ///
+    /// # Returns
+    /// A new `VebNavigator` pointing to the right child position.
+    fn right_child(&self, subtree_sizes: &[SubtreeSizes]) -> VebNavigator {
+        self.child(subtree_sizes, true)
+    }
+
+    /// Checks if the current position is valid (within the bounds of its subtree).
+    /// This should be called after navigating to check if the resulting position
+    /// actually exists in the tree.
+    fn is_valid(&self) -> bool {
+        self.local_position < self.current_subtree_size
+    }
+
+    /// Computes child position within the vEB layout.
+    ///
+    /// The vEB layout organizes nodes as:
+    /// 1. Upper subtree nodes are stored first (contiguously)
+    /// 2. Lower subtrees follow, in order of their parent leaves in the upper subtree
+    ///
+    /// Within the upper subtree, standard binary tree indexing applies:
+    /// - Left child of node at local position `p` is at `2*p + 1`
+    /// - Right child of node at local position `p` is at `2*p + 2`
+    ///
+    /// When transitioning from upper to lower subtree:
+    /// - We jump past the upper subtree
+    /// - Then index into the correct lower subtree based on which leaf we came from
+    fn child(&self, subtree_sizes: &[SubtreeSizes], is_right: bool) -> VebNavigator {
+        if self.veb_depth >= subtree_sizes.len() {
+            // At the deepest vEB level, use simple binary tree arithmetic
+            // within the current subtree bounds
+            let child_local = if is_right {
+                2 * self.local_position + 2
+            } else {
+                2 * self.local_position + 1
+            };
+
+            return VebNavigator {
+                position: self.subtree_base + child_local,
+                subtree_base: self.subtree_base,
+                veb_depth: self.veb_depth,
+                local_position: child_local,
+                current_subtree_size: self.current_subtree_size,
+            };
+        }
+
+        let sizes = &subtree_sizes[self.veb_depth];
+        let upper_size = sizes.upper_size;
+        let lower_size = sizes.lower_size;
+
+        // Child position in standard binary tree indexing within upper subtree
+        let child_local = if is_right {
+            2 * self.local_position + 2
+        } else {
+            2 * self.local_position + 1
+        };
+
+        if child_local < upper_size {
+            // Child is still within the upper subtree
+            VebNavigator {
+                position: self.subtree_base + child_local,
+                subtree_base: self.subtree_base,
+                veb_depth: self.veb_depth,
+                local_position: child_local,
+                current_subtree_size: self.current_subtree_size,
+            }
+        } else {
+            // Child transitions to a lower subtree
+            // Compute which lower subtree (based on leaf index in upper subtree)
+            // In a complete binary tree, leaves are at positions [n/2, n-1] where n = size
+            // The leaf index (0-indexed) is: child_local - upper_size
+            let leaf_index = child_local - upper_size;
+
+            // Lower subtrees are stored after the upper subtree, each of size lower_size
+            let lower_subtree_base = self.subtree_base + upper_size + leaf_index * lower_size;
+
+            VebNavigator {
+                position: lower_subtree_base,
+                subtree_base: lower_subtree_base,
+                veb_depth: self.veb_depth + 1,
+                local_position: 0,
+                current_subtree_size: lower_size,
+            }
+        }
+    }
+}
+
 /// Precomputes subtree sizes at each vEB recursion level for a tree of the given height.
 ///
 /// The vEB layout recursively splits a tree of height h into:
@@ -643,6 +773,26 @@ where
 
     fn root(&'a self) -> &'a Node<K, V> {
         unsafe { &*self.nodes[0].get() }
+    }
+
+    /// Creates a navigator starting at the root of the tree.
+    fn root_navigator(&self) -> VebNavigator {
+        VebNavigator::at_root(self.nodes.len())
+    }
+
+    /// Gets the node at the given navigator position.
+    fn node_at(&'a self, nav: &VebNavigator) -> &'a Node<K, V> {
+        unsafe { &*self.nodes[nav.position].get() }
+    }
+
+    /// Computes the left child position using implicit vEB navigation.
+    fn left_child(&self, nav: &VebNavigator) -> VebNavigator {
+        nav.left_child(&self.subtree_sizes)
+    }
+
+    /// Computes the right child position using implicit vEB navigation.
+    fn right_child(&self, nav: &VebNavigator) -> VebNavigator {
+        nav.right_child(&self.subtree_sizes)
     }
 
     fn find<Q>(&'a self, search_key: &Q, for_insertion: bool) -> SearchResult<'a, K, V>
@@ -898,5 +1048,283 @@ mod tests {
                 );
             }
         }
+    }
+
+    // === VebNavigator tests for Step 2: Implicit child navigation ===
+
+    #[test]
+    fn test_veb_navigator_at_root() {
+        let nav = VebNavigator::at_root(15);
+        assert_eq!(nav.position, 0);
+        assert_eq!(nav.subtree_base, 0);
+        assert_eq!(nav.veb_depth, 0);
+        assert_eq!(nav.local_position, 0);
+        assert_eq!(nav.current_subtree_size, 15);
+    }
+
+    #[test]
+    fn test_veb_navigator_height_2() {
+        // Height 2 tree: 3 nodes
+        // vEB layout for h=2: [root, left, right] (same as standard)
+        // upper_size=1 (root), lower_size=1 (each child)
+        let sizes = precompute_subtree_sizes(2);
+        assert_eq!(sizes.len(), 1);
+        assert_eq!(sizes[0].upper_size, 1);
+        assert_eq!(sizes[0].lower_size, 1);
+
+        let node_count = 3;
+        let root = VebNavigator::at_root(node_count);
+        assert_eq!(root.position, 0);
+
+        // Left child: transitions from upper (size 1) to first lower subtree
+        // Layout: [0: root] [1: left] [2: right]
+        let left = root.left_child(&sizes);
+        assert_eq!(left.position, 1, "Left child should be at position 1");
+        assert_eq!(
+            left.veb_depth, 1,
+            "Left child should be in deeper vEB level"
+        );
+        assert_eq!(left.current_subtree_size, 1, "Lower subtree has size 1");
+
+        // Right child: transitions from upper (size 1) to second lower subtree
+        let right = root.right_child(&sizes);
+        assert_eq!(right.position, 2, "Right child should be at position 2");
+        assert_eq!(
+            right.veb_depth, 1,
+            "Right child should be in deeper vEB level"
+        );
+    }
+
+    #[test]
+    fn test_veb_navigator_height_3() {
+        // Height 3 tree: 7 nodes
+        // vEB split: upper_h=2 (3 nodes), lower_h=1 (1 node each)
+        // Layout: [upper: 0,1,2] [lower0: 3] [lower1: 4] [lower2: 5] [lower3: 6]
+        let sizes = precompute_subtree_sizes(3);
+        assert_eq!(sizes[0].upper_size, 3);
+        assert_eq!(sizes[0].lower_size, 1);
+
+        let node_count = 7;
+        let root = VebNavigator::at_root(node_count);
+        assert_eq!(root.position, 0);
+
+        // Within upper subtree, standard binary tree indexing
+        let left = root.left_child(&sizes);
+        assert_eq!(left.position, 1, "Left child of root in upper subtree");
+        assert_eq!(left.veb_depth, 0, "Still in first vEB level");
+
+        let right = root.right_child(&sizes);
+        assert_eq!(right.position, 2, "Right child of root in upper subtree");
+        assert_eq!(right.veb_depth, 0, "Still in first vEB level");
+
+        // From node 1 (left child of root), descend to lower subtrees
+        // Node 1's left child has local_position 2*1+1=3, which equals upper_size=3
+        // So it transitions to lower subtree at leaf_index=0
+        let left_left = left.left_child(&sizes);
+        assert_eq!(
+            left_left.position, 3,
+            "Left-left should be in first lower subtree"
+        );
+        assert_eq!(left_left.veb_depth, 1, "Transitioned to deeper vEB level");
+
+        // Node 1's right child has local_position 2*1+2=4, > upper_size=3
+        // leaf_index = 4 - 3 = 1, so second lower subtree
+        let left_right = left.right_child(&sizes);
+        assert_eq!(
+            left_right.position, 4,
+            "Left-right should be in second lower subtree"
+        );
+
+        // Node 2's children
+        let right_left = right.left_child(&sizes);
+        assert_eq!(
+            right_left.position, 5,
+            "Right-left should be in third lower subtree"
+        );
+
+        let right_right = right.right_child(&sizes);
+        assert_eq!(
+            right_right.position, 6,
+            "Right-right should be in fourth lower subtree"
+        );
+    }
+
+    #[test]
+    fn test_veb_navigator_height_4() {
+        // Height 4 tree: 15 nodes
+        // vEB split: upper_h=2 (3 nodes), lower_h=2 (3 nodes each)
+        // Layout: [upper: 0,1,2] [lower0: 3,4,5] [lower1: 6,7,8] [lower2: 9,10,11] [lower3: 12,13,14]
+        let sizes = precompute_subtree_sizes(4);
+        assert_eq!(sizes[0].upper_size, 3);
+        assert_eq!(sizes[0].lower_size, 3);
+
+        let node_count = 15;
+        let root = VebNavigator::at_root(node_count);
+
+        // Navigate within upper subtree
+        let left = root.left_child(&sizes);
+        assert_eq!(left.position, 1);
+        let right = root.right_child(&sizes);
+        assert_eq!(right.position, 2);
+
+        // Transition to lower subtrees
+        // From node 1 (local_pos=1), left child has local_pos=3, >= upper_size=3
+        // leaf_index = 3 - 3 = 0, lower subtree at base = 3 + 0*3 = 3
+        let left_left = left.left_child(&sizes);
+        assert_eq!(
+            left_left.position, 3,
+            "Should be root of first lower subtree"
+        );
+        assert_eq!(left_left.subtree_base, 3);
+        assert_eq!(left_left.veb_depth, 1);
+
+        // Within the lower subtree, continue navigation
+        // Lower subtree has sizes[1] = {upper: 1, lower: 1}
+        let lll = left_left.left_child(&sizes);
+        assert_eq!(lll.position, 4, "Left child within lower subtree");
+
+        let llr = left_left.right_child(&sizes);
+        assert_eq!(llr.position, 5, "Right child within lower subtree");
+
+        // Check other lower subtrees
+        let left_right = left.right_child(&sizes);
+        assert_eq!(left_right.position, 6, "Root of second lower subtree");
+        assert_eq!(left_right.subtree_base, 6);
+
+        let right_left = right.left_child(&sizes);
+        assert_eq!(right_left.position, 9, "Root of third lower subtree");
+
+        let right_right = right.right_child(&sizes);
+        assert_eq!(right_right.position, 12, "Root of fourth lower subtree");
+    }
+
+    #[test]
+    fn test_veb_navigator_all_positions_reachable() {
+        // For a complete binary tree, verify all positions are reachable via navigation
+        for height in 2..=5u8 {
+            let sizes = precompute_subtree_sizes(height);
+            let node_count = (1usize << height) - 1;
+            let mut visited = vec![false; node_count];
+
+            // BFS through the tree using navigation
+            let mut queue = vec![VebNavigator::at_root(node_count)];
+            while let Some(nav) = queue.pop() {
+                if !nav.is_valid() {
+                    continue;
+                }
+                visited[nav.position] = true;
+
+                // Add children if they're within bounds
+                let left = nav.left_child(&sizes);
+                let right = nav.right_child(&sizes);
+
+                if left.is_valid() {
+                    queue.push(left);
+                }
+                if right.is_valid() {
+                    queue.push(right);
+                }
+            }
+
+            // All positions should be visited
+            for (i, &v) in visited.iter().enumerate() {
+                assert!(v, "Height {}: Position {} not reachable", height, i);
+            }
+        }
+    }
+
+    #[test]
+    fn test_veb_navigator_no_duplicate_positions() {
+        // Verify that left and right children are always different
+        for height in 2..=5u8 {
+            let sizes = precompute_subtree_sizes(height);
+            let node_count = (1usize << height) - 1;
+
+            let mut queue = vec![VebNavigator::at_root(node_count)];
+            while let Some(nav) = queue.pop() {
+                let left = nav.left_child(&sizes);
+                let right = nav.right_child(&sizes);
+
+                if left.is_valid() && right.is_valid() {
+                    assert_ne!(
+                        left.position, right.position,
+                        "Height {}: Node at {} has same position for both children: {}",
+                        height, nav.position, left.position
+                    );
+                    queue.push(left);
+                    queue.push(right);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_veb_navigator_leaf_count() {
+        // The number of leaves (nodes with children out of bounds) should be 2^(h-1)
+        for height in 2..=5u8 {
+            let sizes = precompute_subtree_sizes(height);
+            let node_count = (1usize << height) - 1;
+            let expected_leaf_count = 1usize << (height - 1);
+
+            let mut leaf_count = 0;
+            let mut queue = vec![VebNavigator::at_root(node_count)];
+            let mut visited = vec![false; node_count];
+
+            while let Some(nav) = queue.pop() {
+                if !nav.is_valid() || visited[nav.position] {
+                    continue;
+                }
+                visited[nav.position] = true;
+
+                let left = nav.left_child(&sizes);
+                let right = nav.right_child(&sizes);
+
+                // A leaf has both children invalid (out of subtree bounds)
+                let left_invalid = !left.is_valid();
+                let right_invalid = !right.is_valid();
+
+                if left_invalid && right_invalid {
+                    leaf_count += 1;
+                } else {
+                    // Only add children that are valid
+                    if !left_invalid {
+                        queue.push(left);
+                    }
+                    if !right_invalid {
+                        queue.push(right);
+                    }
+                }
+            }
+
+            assert_eq!(
+                leaf_count, expected_leaf_count,
+                "Height {}: Expected {} leaves, found {}",
+                height, expected_leaf_count, leaf_count
+            );
+        }
+    }
+
+    #[test]
+    fn test_veb_navigator_is_valid() {
+        // Test the is_valid method
+        let sizes = precompute_subtree_sizes(2);
+        let node_count = 3;
+        let root = VebNavigator::at_root(node_count);
+
+        // Root should be valid
+        assert!(root.is_valid());
+
+        // Children of root should be valid
+        let left = root.left_child(&sizes);
+        let right = root.right_child(&sizes);
+        assert!(left.is_valid());
+        assert!(right.is_valid());
+
+        // Children of leaves (positions 1 and 2) should be invalid
+        // since they're single-node subtrees with no children
+        let left_left = left.left_child(&sizes);
+        let left_right = left.right_child(&sizes);
+        assert!(!left_left.is_valid(), "Child of leaf should be invalid");
+        assert!(!left_right.is_valid(), "Child of leaf should be invalid");
     }
 }

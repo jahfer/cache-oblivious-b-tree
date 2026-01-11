@@ -196,7 +196,7 @@ impl<K, V> BTreeMap<K, V> {
 
 1. **[x] Add subtree size precomputation** — Implement `precompute_subtree_sizes()` and store in `BlockSearchTree`
 
-2. **[ ] Implement implicit child navigation** — Add `left_child()`, `right_child()` methods using position arithmetic instead of pointer derefs
+2. **[x] Implement implicit child navigation** — Add `left_child()`, `right_child()` methods using position arithmetic instead of pointer derefs
 
 3. **[ ] Remove pointer fields from Node** — Change `Node::Internal` to only store `min_rhs`, remove `left`/`right` `NonNull` fields
 
