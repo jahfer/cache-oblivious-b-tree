@@ -2,6 +2,7 @@ use std::borrow::Borrow;
 use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::fmt::{self, Debug};
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, RwLock, Weak};
@@ -14,6 +15,35 @@ use super::cell::{Cell, CellGuard, CellIterator, Key, Marker};
 use super::packed_memory_array::PackedMemoryArray;
 
 const INDEX_UPDATE_DELAY: time::Duration = time::Duration::from_millis(50);
+
+/// Result of a rebalance operation, indicating which blocks (leaves) were affected.
+/// This enables incremental index updates instead of full O(N) rebuilds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebalanceResult {
+    /// The range of block indices (leaf indices) that were affected by the rebalance.
+    /// These blocks may have had their minimum key changed due to cells moving.
+    /// An empty range indicates no blocks were affected.
+    pub affected_blocks: Range<usize>,
+}
+
+impl RebalanceResult {
+    /// Creates a new RebalanceResult with the given affected block range.
+    pub fn new(affected_blocks: Range<usize>) -> Self {
+        RebalanceResult { affected_blocks }
+    }
+
+    /// Creates a RebalanceResult indicating no blocks were affected.
+    pub fn none() -> Self {
+        RebalanceResult {
+            affected_blocks: 0..0,
+        }
+    }
+
+    /// Returns true if any blocks were affected by the rebalance.
+    pub fn has_affected_blocks(&self) -> bool {
+        !self.affected_blocks.is_empty()
+    }
+}
 
 pub struct BTreeMap<K: Clone + Ord, V: Clone> {
     data: Arc<PackedMemoryArray<Cell<K, V>>>,
@@ -188,10 +218,13 @@ where
         is_updating
     }
 
-    fn rebalance(&self, cell_ptr_start: *const Cell<K, V>, for_insertion: bool) {
+    fn rebalance(&self, cell_ptr_start: *const Cell<K, V>, for_insertion: bool) -> RebalanceResult {
         let mut count = 1;
         let mut cells_to_move: VecDeque<*const Cell<K, V>> = VecDeque::new();
         let mut current_cell_ptr = cell_ptr_start;
+
+        // Track the range of cells affected for computing block indices
+        let mut last_cell_ptr = cell_ptr_start;
 
         let vec = self
             .data
@@ -202,6 +235,7 @@ where
 
         for cell_guard in vec {
             current_cell_ptr = cell_guard.inner;
+            last_cell_ptr = cell_guard.inner;
 
             if !cell_guard.is_empty() {
                 cells_to_move.push_front(cell_guard.inner);
@@ -311,6 +345,61 @@ where
             } else {
                 unreachable!("We've reached the end of the initialized cell buffer!");
             }
+        }
+
+        // Compute the affected block range
+        // Cells move from first_cell_ptr toward current_cell_ptr (which moved backward)
+        // The affected range spans from the destination (current_cell_ptr moved back)
+        // to the source area (first_cell_ptr through last_cell_ptr)
+        self.compute_affected_blocks(current_cell_ptr, last_cell_ptr)
+    }
+
+    /// Computes the block index (leaf index) for a given cell pointer.
+    ///
+    /// Block index is determined by: cell_offset / slot_size
+    /// where slot_size = log2(requested_capacity)
+    ///
+    /// Returns None if the pointer is outside the active range.
+    fn cell_ptr_to_block_index(&self, cell_ptr: *const Cell<K, V>) -> Option<usize> {
+        let base_ptr = self.data.as_slice().as_ptr();
+        let slice_len = self.data.as_slice().len();
+
+        // Check bounds
+        let offset = unsafe { cell_ptr.offset_from(base_ptr) };
+        if offset < 0 || offset as usize >= slice_len {
+            return None;
+        }
+
+        let cell_offset = offset as usize;
+        let slot_size = self.data.requested_capacity.ilog2() as usize;
+        Some(cell_offset / slot_size)
+    }
+
+    /// Computes the range of blocks affected by a rebalance operation.
+    ///
+    /// The affected range includes all blocks from the destination area
+    /// (where cells were moved to) through the source area (where cells came from).
+    fn compute_affected_blocks(
+        &self,
+        dest_ptr: *const Cell<K, V>,
+        source_end_ptr: *const Cell<K, V>,
+    ) -> RebalanceResult {
+        // Get block indices for the range boundaries
+        let dest_block = self.cell_ptr_to_block_index(dest_ptr);
+        let source_block = self.cell_ptr_to_block_index(source_end_ptr);
+
+        match (dest_block, source_block) {
+            (Some(start), Some(end)) => {
+                // Range is from dest (lower address) to source (higher address)
+                // Add 1 to end because Range is exclusive
+                let (lo, hi) = if start <= end {
+                    (start, end + 1)
+                } else {
+                    (end, start + 1)
+                };
+                RebalanceResult::new(lo..hi)
+            }
+            _ => RebalanceResult::none(),
         }
     }
 
@@ -1822,5 +1911,63 @@ mod tests {
                 _ => panic!("Expected Leaf at position {}", pos),
             }
         }
+    }
+
+    // === Step 5 tests: RebalanceResult and affected block computation ===
+
+    #[test]
+    fn test_rebalance_result_new() {
+        let result = RebalanceResult::new(2..5);
+        assert_eq!(result.affected_blocks, 2..5);
+        assert!(result.has_affected_blocks());
+    }
+
+    #[test]
+    fn test_rebalance_result_none() {
+        let result = RebalanceResult::none();
+        assert_eq!(result.affected_blocks, 0..0);
+        assert!(!result.has_affected_blocks());
+    }
+
+    #[test]
+    fn test_rebalance_result_has_affected_blocks() {
+        // Empty range should return false
+        let empty = RebalanceResult::new(0..0);
+        assert!(!empty.has_affected_blocks());
+
+        let empty2 = RebalanceResult::new(5..5);
+        assert!(!empty2.has_affected_blocks());
+
+        // Non-empty range should return true
+        let non_empty = RebalanceResult::new(0..1);
+        assert!(non_empty.has_affected_blocks());
+
+        let non_empty2 = RebalanceResult::new(3..10);
+        assert!(non_empty2.has_affected_blocks());
+    }
+
+    #[test]
+    fn test_rebalance_result_equality() {
+        let r1 = RebalanceResult::new(1..5);
+        let r2 = RebalanceResult::new(1..5);
+        let r3 = RebalanceResult::new(2..5);
+
+        assert_eq!(r1, r2);
+        assert_ne!(r1, r3);
+    }
+
+    #[test]
+    fn test_rebalance_result_debug() {
+        let result = RebalanceResult::new(2..4);
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("RebalanceResult"));
+        assert!(debug_str.contains("affected_blocks"));
+    }
+
+    #[test]
+    fn test_rebalance_result_clone() {
+        let original = RebalanceResult::new(5..10);
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
     }
 }

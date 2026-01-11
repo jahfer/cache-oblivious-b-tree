@@ -202,7 +202,7 @@ impl<K, V> BTreeMap<K, V> {
 
 4. **[x] Implement `update_leaf()`** — Single-leaf min_key update with optional ancestor propagation
 
-5. **[ ] Modify PMA rebalance to return affected range** — Return `RebalanceResult` indicating which blocks shifted
+5. **[x] Modify PMA rebalance to return affected range** — Return `RebalanceResult` indicating which blocks shifted
 
 6. **[ ] Remove async indexing** — Delete channel, thread, delay constant, `request_reindex()`
 

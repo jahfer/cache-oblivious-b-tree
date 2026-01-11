@@ -237,3 +237,58 @@ When a leaf's min_key changes, internal nodes may need their `min_rhs` updated. 
 ### Next steps
 
 Step 5 will modify the PMA rebalance operation to return a `RebalanceResult` indicating which blocks were affected, enabling the caller to selectively update only those leaves.
+
+## Step 5: Modify PMA rebalance to return affected range (Jan 11, 2026)
+
+### What was implemented
+
+Added infrastructure for tracking which blocks are affected during rebalancing, enabling incremental index updates.
+
+**New type added to `btree_map.rs`:**
+
+- `RebalanceResult` struct: Contains `affected_blocks: Range<usize>` indicating which leaf indices need their min_key refreshed after a rebalance
+
+**New methods on `RebalanceResult`:**
+
+- `new(affected_blocks: Range<usize>) -> Self`: Creates a new result with the given affected range
+- `none() -> Self`: Creates a result indicating no blocks were affected (empty range)
+- `has_affected_blocks(&self) -> bool`: Returns true if any blocks were affected
+
+**New methods on `BTreeMap`:**
+
+- `cell_ptr_to_block_index(&self, cell_ptr: *const Cell<K, V>) -> Option<usize>`: Computes block index from cell pointer using `cell_offset / slot_size`
+- `compute_affected_blocks(&self, dest_ptr, source_end_ptr) -> RebalanceResult`: Computes the range of blocks affected by a rebalance
+
+**Modified `BTreeMap::rebalance()`:**
+
+- Changed return type from `()` to `RebalanceResult`
+- Tracks the source range boundaries (`last_cell_ptr`) during cell scanning
+- After moving cells, computes and returns the affected block range
+
+### How it works
+
+**Block index computation:**
+Each block (leaf in the search tree) corresponds to `slot_size` cells in the PMA, where `slot_size = log2(requested_capacity)`. A cell at offset `n` belongs to block `n / slot_size`.
+
+**Affected range tracking:**
+During rebalance, cells move from a source region toward a destination region. The function tracks:
+
+1. The destination pointer (moves backward as cells are placed)
+2. The source end pointer (the last cell examined during density scanning)
+
+The affected blocks are those spanning from the destination block to the source block (inclusive).
+
+### Tests added
+
+6 new unit tests in `cache_oblivious::btree_map::tests`:
+
+- `test_rebalance_result_new`: Verifies construction with a specific range
+- `test_rebalance_result_none`: Tests empty/none result creation
+- `test_rebalance_result_has_affected_blocks`: Tests empty vs non-empty range detection
+- `test_rebalance_result_equality`: Tests PartialEq implementation
+- `test_rebalance_result_debug`: Tests Debug formatting
+- `test_rebalance_result_clone`: Tests Clone implementation
+
+### Next steps
+
+Step 6 will remove the async indexing infrastructure (channel, thread, delay constant, `request_reindex()`), preparing for synchronous incremental updates in Step 7.
