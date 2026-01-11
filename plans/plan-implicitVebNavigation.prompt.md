@@ -200,15 +200,13 @@ impl<K, V> BTreeMap<K, V> {
 
 3. **[x] Remove pointer fields from Node** — Change `Node::Internal` to only store `min_rhs`, remove `left`/`right` `NonNull` fields
 
-4. **[ ] Add leaf position tracking** — Store `first_leaf_index` to enable O(1) leaf-to-position mapping
+4. **[ ] Implement `update_leaf()`** — Single-leaf min_key update with optional ancestor propagation
 
-5. **[ ] Implement `update_leaf()`** — Single-leaf min_key update with optional ancestor propagation
+5. **[ ] Modify PMA rebalance to return affected range** — Return `RebalanceResult` indicating which blocks shifted
 
-6. **[ ] Modify PMA rebalance to return affected range** — Return `RebalanceResult` indicating which blocks shifted
+6. **[ ] Remove async indexing** — Delete channel, thread, delay constant, `request_reindex()`
 
-7. **[ ] Remove async indexing** — Delete channel, thread, delay constant, `request_reindex()`
-
-8. **[ ] Wire incremental updates into insert** — After PMA operations, call `update_leaf()` for affected blocks
+7. **[ ] Wire incremental updates into insert** — After PMA operations, call `update_leaf()` for affected blocks
 
 ## Complexity Analysis
 
