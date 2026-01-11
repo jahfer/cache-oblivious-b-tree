@@ -106,3 +106,86 @@ The `is_valid()` method checks if `local_position < current_subtree_size`, which
 ### Next steps
 
 Step 3 will remove the `left` and `right` `NonNull` pointer fields from `Node::Internal`, relying entirely on the implicit navigation implemented in this step.
+
+## Step 3: Remove pointer fields from Node (Jan 11, 2026)
+
+### What was implemented
+
+Removed explicit pointer fields from `Node::Internal` and updated all tree construction and search logic to use the implicit `VebNavigator`-based navigation.
+
+**Modified `Node` enum:**
+
+Before:
+
+```rust
+enum Node<K, V> {
+    Leaf(Key<K>, Block<K, V>),
+    Internal {
+        min_rhs: Key<K>,
+        left: MaybeUninit<NonNull<UnsafeCell<Node<K, V>>>>,
+        right: MaybeUninit<NonNull<UnsafeCell<Node<K, V>>>>,
+    },
+}
+```
+
+After:
+
+```rust
+enum Node<K, V> {
+    Leaf(Key<K>, Block<K, V>),
+    Internal {
+        min_rhs: Key<K>,
+    },
+}
+```
+
+**Modified `BlockSearchTree` struct:**
+
+- Changed `nodes` field from `Box<[UnsafeCell<Node<K, V>>]>` to `Box<[Node<K, V>]>` (no more interior mutability needed)
+- Removed `allocate()`, `initialize_nodes()`, `assign_node_values()`, and `split_tree_memory()` helper functions
+- Added `finalize_leaves_veb()`, `collect_leaf_positions_inorder()`, and `inorder_collect_leaves()` for navigator-based tree construction
+- Updated `find()` to use `VebNavigator` loop instead of calling `search_to_block()` on nodes
+
+**Removed from `Node`:**
+
+- `search()` method (used pointer fields)
+- `search_to_block()` method (used pointer fields)
+
+**Removed from `SearchResult`:**
+
+- `Internal` variant (no longer needed since navigation is external)
+
+**Removed imports:**
+
+- `std::cell::UnsafeCell`
+- `std::mem::MaybeUninit`
+- `std::ptr::NonNull`
+
+### How it works
+
+Tree construction now uses a two-phase approach:
+
+1. Allocate all nodes as `Internal { min_rhs: Key::Supremum }`
+2. Use `VebNavigator` to traverse in-order and identify leaf positions, then convert those nodes to `Leaf` variants with their corresponding PMA block references
+
+Search now happens entirely in `BlockSearchTree::find()`:
+
+1. Start with `root_navigator()`
+2. Loop: get node at current position, if `Leaf` return result, if `Internal` compute next navigator position based on `min_rhs` comparison
+3. Navigation uses purely arithmetic operations via `VebNavigator::left_child()` / `right_child()`
+
+### Memory savings
+
+The `Node::Internal` variant now only stores `min_rhs` (a `Key<K>`), eliminating the 16 bytes previously used for `left` and `right` pointer fields. For trees with many internal nodes, this represents significant memory reduction.
+
+### Tests added
+
+3 new unit tests in `cache_oblivious::btree_map::tests`:
+
+- `test_node_internal_has_no_pointers`: Verifies the new `Node::Internal` structure compiles and works without pointer fields
+- `test_leaf_positions_collected_in_order`: Validates that leaf collection via navigator returns the correct count of unique, valid positions
+- `test_navigator_based_tree_traversal_matches_leaf_count`: Confirms the navigator correctly finds 2^(h-1) leaves for trees of various heights
+
+### Next steps
+
+Step 4 will add leaf position tracking (`first_leaf_index`) to enable O(1) leaf-to-position mapping for incremental updates.

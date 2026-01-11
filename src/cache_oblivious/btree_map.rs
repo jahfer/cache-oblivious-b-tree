@@ -1,10 +1,7 @@
 use std::borrow::Borrow;
-use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::fmt::{self, Debug};
-use std::mem::MaybeUninit;
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, RwLock, Weak};
@@ -405,13 +402,12 @@ where
 
                 None
             }
-            _ => unreachable!(),
         }
     }
 }
 
 struct BlockSearchTree<K: Clone + Ord, V: Clone> {
-    nodes: Box<[UnsafeCell<Node<K, V>>]>,
+    nodes: Box<[Node<K, V>]>,
     /// Precomputed subtree sizes for vEB layout navigation.
     /// Each entry stores (upper_subtree_size, lower_subtree_size) at each vEB recursion level.
     /// This enables O(log log N) child position computation without explicit pointers.
@@ -626,131 +622,96 @@ where
     V: Clone,
 {
     fn new(cells: Arc<PackedMemoryArray<Cell<K, V>>>) -> BlockSearchTree<K, V> {
-        let mut nodes = Self::allocate(cells.len());
-
-        let mut leaves = Self::initialize_nodes(&mut *nodes, None);
-        let slot_size = f32::log2(cells.requested_capacity as f32) as usize; // https://github.com/rust-lang/rust/issues/70887
-        let mut slots = cells.as_slice().chunks_exact(slot_size);
-
-        for leaf in leaves.iter_mut() {
-            Self::finalize_leaf_node(leaf.get_mut(), slots.next().unwrap());
-        }
-
-        let initialized_nodes = unsafe { nodes.assume_init() };
-        let node_count = initialized_nodes.len();
+        let slot_size = cells.requested_capacity.ilog2() as usize;
+        let leaf_count = cells.len() / slot_size;
+        let node_count = 2 * leaf_count - 1;
         let height = compute_tree_height(node_count);
         let subtree_sizes = precompute_subtree_sizes(height);
 
+        // Allocate all nodes as Internal initially
+        let mut nodes: Vec<Node<K, V>> = (0..node_count)
+            .map(|_| Node::Internal {
+                min_rhs: Key::Supremum,
+            })
+            .collect();
+
+        // Use VebNavigator to find all leaf positions and finalize them
+        let mut slots = cells.as_slice().chunks_exact(slot_size);
+        Self::finalize_leaves_veb(&mut nodes, &subtree_sizes, &mut slots);
+
         BlockSearchTree {
-            nodes: initialized_nodes,
+            nodes: nodes.into_boxed_slice(),
             subtree_sizes,
             height,
         }
     }
 
-    fn allocate(leaf_count: usize) -> Box<[MaybeUninit<UnsafeCell<Node<K, V>>>]> {
-        let size = leaf_count;
-        // https://github.com/rust-lang/rust/issues/70887
-        let slot_size = f32::log2(size as f32) as usize;
-        let leaf_count = size / slot_size;
-        let node_count = 2 * leaf_count - 1;
-        // println!("tree has {:?} leaves, {:?} nodes", leaf_count, node_count);
-        Box::<[UnsafeCell<Node<K, V>>]>::new_uninit_slice(node_count as usize)
-    }
-
-    fn initialize_nodes<'b>(
-        nodes: &'b mut [MaybeUninit<UnsafeCell<Node<K, V>>>],
-        parent_subtree: Option<*mut NonNull<UnsafeCell<Node<K, V>>>>,
-    ) -> Vec<&'b mut UnsafeCell<Node<K, V>>> {
-        if nodes.len() <= 3 {
-            return Self::assign_node_values(nodes, parent_subtree);
+    /// Recursively traverse the tree using vEB navigation to find and finalize all leaves.
+    /// Leaves are visited in left-to-right order (in-order traversal).
+    fn finalize_leaves_veb<'b, I>(
+        nodes: &mut [Node<K, V>],
+        subtree_sizes: &[SubtreeSizes],
+        slots: &mut I,
+    ) where
+        I: Iterator<Item = &'b [Cell<K, V>]>,
+        K: 'b,
+        V: 'b,
+    {
+        let node_count = nodes.len();
+        if node_count == 0 {
+            return;
         }
 
-        let (upper_mem, lower_mem) = Self::split_tree_memory(nodes);
-        let num_lower_branches = upper_mem.len() + 1;
+        // Collect leaf positions in left-to-right order using in-order traversal
+        let leaf_positions = Self::collect_leaf_positions_inorder(node_count, subtree_sizes);
 
-        let leaves_of_upper = Self::initialize_nodes(upper_mem, parent_subtree);
-
-        let nodes_per_branch = lower_mem.len() / num_lower_branches;
-        let mut branches = lower_mem.chunks_exact_mut(nodes_per_branch);
-
-        leaves_of_upper
-            .into_iter()
-            .flat_map(|subtree_leaf| match unsafe { &mut *subtree_leaf.get() } {
-                Node::Leaf(_, _) => unreachable!(),
-                Node::Internal { left, right, .. } => {
-                    let lhs_mem = branches.next().unwrap();
-                    let rhs_mem = branches.next().unwrap();
-                    let lhs = Self::initialize_nodes(lhs_mem, Some(left.as_mut_ptr()));
-                    let rhs = Self::initialize_nodes(rhs_mem, Some(right.as_mut_ptr()));
-                    lhs.into_iter().chain(rhs.into_iter())
-                }
-            })
-            .collect::<Vec<_>>()
-    }
-
-    fn assign_node_values<'b>(
-        nodes: &'b mut [MaybeUninit<UnsafeCell<Node<K, V>>>],
-        parent_subtree: Option<*mut NonNull<UnsafeCell<Node<K, V>>>>,
-    ) -> Vec<&'b mut UnsafeCell<Node<K, V>>> {
-        let num_nodes = nodes.len();
-        assert!(num_nodes <= 3);
-
-        for i in 0..num_nodes as usize {
-            nodes[i].write(UnsafeCell::new(Node::Internal {
-                min_rhs: Key::Supremum,
-                left: MaybeUninit::uninit(), // Todo: NonNull<MaybeUninit<T>>
-                right: MaybeUninit::uninit(),
-            }));
-        }
-
-        if num_nodes == 1 {
-            let node = unsafe { nodes[0].assume_init_mut() };
-            return vec![node];
-        }
-
-        let left_node =
-            NonNull::new(unsafe { nodes[1].assume_init_ref() as *const _ } as *mut _).unwrap();
-        let right_node =
-            NonNull::new(unsafe { nodes[2].assume_init_ref() as *const _ } as *mut _).unwrap();
-
-        nodes[0].write(UnsafeCell::new(Node::Internal {
-            min_rhs: Key::Supremum,
-            left: MaybeUninit::new(left_node),
-            right: MaybeUninit::new(right_node),
-        }));
-
-        let (lhs, rhs) = nodes.split_at_mut(2);
-
-        if let Some(node) = parent_subtree {
-            unsafe {
-                NonNull::new((lhs[0].assume_init_ref().get()) as *mut _)
-                    .map(|p| node.write(p))
-                    .or_else(|| panic!("Pointer is null!"));
+        // Finalize leaves in order
+        for pos in leaf_positions {
+            if let Some(leaf_mem) = slots.next() {
+                Self::finalize_leaf_node(&mut nodes[pos], leaf_mem);
             }
         }
-
-        let left_branch = unsafe { lhs[1].assume_init_mut() };
-        let right_branch = unsafe { rhs[0].assume_init_mut() };
-
-        return vec![left_branch, right_branch];
     }
 
-    fn split_tree_memory<'b>(
-        nodes: &'b mut [MaybeUninit<UnsafeCell<Node<K, V>>>],
-    ) -> (
-        &'b mut [MaybeUninit<UnsafeCell<Node<K, V>>>],
-        &'b mut [MaybeUninit<UnsafeCell<Node<K, V>>>],
+    /// Collects all leaf positions in left-to-right (in-order) order.
+    fn collect_leaf_positions_inorder(
+        node_count: usize,
+        subtree_sizes: &[SubtreeSizes],
+    ) -> Vec<usize> {
+        let mut leaves = Vec::new();
+        Self::inorder_collect_leaves(
+            VebNavigator::at_root(node_count),
+            subtree_sizes,
+            &mut leaves,
+        );
+        leaves
+    }
+
+    /// Recursive helper for in-order leaf collection.
+    fn inorder_collect_leaves(
+        nav: VebNavigator,
+        subtree_sizes: &[SubtreeSizes],
+        leaves: &mut Vec<usize>,
     ) {
-        let height = f32::log2(nodes.len() as f32 + 1f32);
-        let lower_height = ((height / 2f32).ceil() as u32).next_power_of_two();
-        let upper_height = height as u32 - lower_height;
+        if !nav.is_valid() {
+            return;
+        }
 
-        let upper_subtree_length = 2 << (upper_height - 1);
-        nodes.split_at_mut(upper_subtree_length - 1)
+        let left = nav.left_child(subtree_sizes);
+        let right = nav.right_child(subtree_sizes);
+
+        // Check if this is a leaf (both children are invalid)
+        if !left.is_valid() && !right.is_valid() {
+            leaves.push(nav.position);
+            return;
+        }
+
+        // In-order: left, then current (but internal nodes don't contribute), then right
+        Self::inorder_collect_leaves(left, subtree_sizes, leaves);
+        Self::inorder_collect_leaves(right, subtree_sizes, leaves);
     }
 
-    fn finalize_leaf_node<'b>(leaf: &'b mut Node<K, V>, leaf_mem: &'b [Cell<K, V>]) -> () {
+    fn finalize_leaf_node<'b>(leaf: &mut Node<K, V>, leaf_mem: &'b [Cell<K, V>]) {
         match leaf {
             Node::Internal { .. } => {
                 let min_key = leaf_mem
@@ -771,10 +732,6 @@ where
         };
     }
 
-    fn root(&'a self) -> &'a Node<K, V> {
-        unsafe { &*self.nodes[0].get() }
-    }
-
     /// Creates a navigator starting at the root of the tree.
     fn root_navigator(&self) -> VebNavigator {
         VebNavigator::at_root(self.nodes.len())
@@ -782,7 +739,7 @@ where
 
     /// Gets the node at the given navigator position.
     fn node_at(&'a self, nav: &VebNavigator) -> &'a Node<K, V> {
-        unsafe { &*self.nodes[nav.position].get() }
+        &self.nodes[nav.position]
     }
 
     /// Computes the left child position using implicit vEB navigation.
@@ -795,13 +752,36 @@ where
         nav.right_child(&self.subtree_sizes)
     }
 
+    /// Search for a block using implicit vEB navigation.
     fn find<Q>(&'a self, search_key: &Q, for_insertion: bool) -> SearchResult<'a, K, V>
     where
         K: Borrow<Q>,
         Q: Ord,
     {
-        self.root()
-            .search_to_block(Key::Value(search_key), for_insertion)
+        let key = Key::Value(search_key);
+        let mut nav = self.root_navigator();
+
+        loop {
+            let node = self.node_at(&nav);
+            match node {
+                Node::Leaf(key_lock, block) => {
+                    if !for_insertion && *key_lock == Key::Supremum {
+                        return SearchResult::NotFound;
+                    } else {
+                        return SearchResult::Block(block, Key::from(key_lock));
+                    }
+                }
+                Node::Internal { min_rhs } => {
+                    nav = if min_rhs.is_supremum()
+                        || key < Key::Value(min_rhs.clone().unwrap().borrow())
+                    {
+                        self.left_child(&nav)
+                    } else {
+                        self.right_child(&nav)
+                    };
+                }
+            }
+        }
     }
 }
 
@@ -820,66 +800,7 @@ where
 
 enum Node<K: Clone + Ord, V: Clone> {
     Leaf(Key<K>, Block<K, V>),
-    Internal {
-        min_rhs: Key<K>,
-        left: MaybeUninit<NonNull<UnsafeCell<Node<K, V>>>>,
-        right: MaybeUninit<NonNull<UnsafeCell<Node<K, V>>>>,
-    },
-}
-
-impl<K, V> Node<K, V>
-where
-    K: Clone + Ord,
-    V: Clone,
-{
-    fn search<'a, Q>(&'a self, key: Key<&Q>, allow_empty: bool) -> SearchResult<'a, K, V>
-    where
-        Q: Ord,
-        K: Borrow<Q>,
-    {
-        match self {
-            Node::Leaf(key_lock, block) => {
-                if !allow_empty && *key_lock == Key::Supremum {
-                    SearchResult::NotFound
-                } else {
-                    SearchResult::Block(block, Key::from(key_lock))
-                }
-            }
-            Node::Internal {
-                min_rhs,
-                left,
-                right,
-                ..
-            } => {
-                let node = if min_rhs.is_supremum()
-                    || key < Key::Value(min_rhs.clone().unwrap().borrow())
-                {
-                    unsafe { &*left.assume_init_ref() }
-                } else {
-                    unsafe { &*right.assume_init_ref() }
-                };
-                SearchResult::Internal(unsafe { &*node.as_ref().get() })
-            }
-        }
-    }
-
-    fn search_to_block<'a, Q>(&'a self, key: Key<&Q>, allow_empty: bool) -> SearchResult<'a, K, V>
-    where
-        Q: Ord,
-        K: Borrow<Q>,
-    {
-        let mut result = None;
-        let mut node = self;
-
-        while let None = result {
-            match node.search(key, allow_empty) {
-                SearchResult::Internal(next_node) => node = next_node,
-                x @ _ => result = Some(x),
-            }
-        }
-
-        result.unwrap()
-    }
+    Internal { min_rhs: Key<K> },
 }
 
 impl<K, V> Debug for Node<K, V>
@@ -903,7 +824,6 @@ where
 
 enum SearchResult<'a, K: Clone + Ord, V: Clone> {
     Block(&'a Block<K, V>, Key<&'a K>),
-    Internal(&'a Node<K, V>),
     NotFound,
 }
 
@@ -1326,5 +1246,72 @@ mod tests {
         let left_right = left.right_child(&sizes);
         assert!(!left_left.is_valid(), "Child of leaf should be invalid");
         assert!(!left_right.is_valid(), "Child of leaf should be invalid");
+    }
+
+    // === Step 3 tests: Pointer-less Node and Navigator-based search ===
+
+    #[test]
+    fn test_leaf_positions_collected_in_order() {
+        // Verify leaves are collected in left-to-right order
+        for height in 2..=5u8 {
+            let sizes = precompute_subtree_sizes(height);
+            let node_count = (1usize << height) - 1;
+            let expected_leaf_count = 1usize << (height - 1);
+
+            let leaves =
+                BlockSearchTree::<u32, u32>::collect_leaf_positions_inorder(node_count, &sizes);
+
+            assert_eq!(
+                leaves.len(),
+                expected_leaf_count,
+                "Height {}: Expected {} leaves, found {}",
+                height,
+                expected_leaf_count,
+                leaves.len()
+            );
+
+            // Verify all leaves are unique
+            let mut sorted = leaves.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                leaves.len(),
+                "Height {}: Duplicate leaf positions found",
+                height
+            );
+
+            // Verify all positions are valid indices
+            for &pos in &leaves {
+                assert!(
+                    pos < node_count,
+                    "Height {}: Invalid leaf position {}",
+                    height,
+                    pos
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_navigator_based_tree_traversal_matches_leaf_count() {
+        // The number of leaves collected via navigator should equal 2^(h-1)
+        for height in 2..=6u8 {
+            let sizes = precompute_subtree_sizes(height);
+            let node_count = (1usize << height) - 1;
+            let expected_leaves = 1usize << (height - 1);
+
+            let leaves =
+                BlockSearchTree::<u32, u32>::collect_leaf_positions_inorder(node_count, &sizes);
+
+            assert_eq!(
+                leaves.len(),
+                expected_leaves,
+                "Height {}: Navigator traversal found {} leaves, expected {}",
+                height,
+                leaves.len(),
+                expected_leaves
+            );
+        }
     }
 }

@@ -198,7 +198,7 @@ impl<K, V> BTreeMap<K, V> {
 
 2. **[x] Implement implicit child navigation** — Add `left_child()`, `right_child()` methods using position arithmetic instead of pointer derefs
 
-3. **[ ] Remove pointer fields from Node** — Change `Node::Internal` to only store `min_rhs`, remove `left`/`right` `NonNull` fields
+3. **[x] Remove pointer fields from Node** — Change `Node::Internal` to only store `min_rhs`, remove `left`/`right` `NonNull` fields
 
 4. **[ ] Add leaf position tracking** — Store `first_leaf_index` to enable O(1) leaf-to-position mapping
 
