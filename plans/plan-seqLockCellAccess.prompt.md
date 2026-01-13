@@ -19,11 +19,11 @@ Replace the marker-based protocol with a pure SeqLock pattern using `AtomicU32`.
 
 1. ~~**Change version to `AtomicU32`** in [cell.rs#L84](src/cache_oblivious/cell.rs#L84) and initialize to `0` (even = stable).~~
 
-2. **Add SeqLock primitives to `Cell`**:
+2. ~~**Add SeqLock primitives to `Cell`**:~~
 
-   - `begin_write() -> SeqLockWriteGuard` — spins until version is even, CAS to odd
-   - `read_consistent<F, R>(f: F) -> R` — loop until stable read
-   - `SeqLockWriteGuard` — RAII guard that bumps version to even on drop
+   - ~~`begin_write() -> SeqLockWriteGuard` — spins until version is even, CAS to odd~~
+   - ~~`read_consistent<F, R>(f: F) -> R` — loop until stable read~~
+   - ~~`SeqLockWriteGuard` — RAII guard that bumps version to even on drop~~
 
 3. **Update `CellGuard`** in [cell.rs#L150-L160](src/cache_oblivious/cell.rs#L150-L160):
 

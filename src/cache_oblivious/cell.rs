@@ -101,6 +101,128 @@ impl<K: Clone, V: Clone> Cell<K, V> {
             value: UnsafeCell::new(None),
         }
     }
+
+    /// Acquire exclusive write access using SeqLock protocol.
+    /// Spins until version is even (stable), then atomically sets it to odd (write in progress).
+    /// Returns a guard that bumps version back to even on drop.
+    pub fn begin_write(&self) -> SeqLockWriteGuard<'_, K, V> {
+        loop {
+            let v = self.version.load(AtomicOrdering::Acquire);
+            // If version is odd, a write is in progress - spin
+            if v % 2 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+            // Try to CAS from even to odd (acquire write lock)
+            if self
+                .version
+                .compare_exchange_weak(
+                    v,
+                    v.wrapping_add(1),
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                )
+                .is_ok()
+            {
+                return SeqLockWriteGuard { cell: self };
+            }
+        }
+    }
+
+    /// Read cell data consistently using SeqLock protocol.
+    /// Loops until a stable read is achieved (version unchanged and even throughout).
+    pub fn read_consistent<F, R>(&self, f: F) -> R
+    where
+        F: Fn(&Option<K>, &Option<V>) -> R,
+        R: Clone,
+    {
+        loop {
+            let v1 = self.version.load(AtomicOrdering::Acquire);
+            // If version is odd, a write is in progress - spin
+            if v1 % 2 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+
+            // Read the data
+            let result = f(unsafe { &*self.key.get() }, unsafe { &*self.value.get() });
+
+            // Ensure all reads complete before checking version
+            std::sync::atomic::fence(AtomicOrdering::Acquire);
+
+            // If version unchanged, we got a consistent read
+            if v1 == self.version.load(AtomicOrdering::Relaxed) {
+                return result;
+            }
+            // Version changed - retry
+        }
+    }
+
+    /// Read cell data and return both the result and the version observed.
+    /// Useful for caching the version to detect staleness later.
+    pub fn read_with_version<F, R>(&self, f: F) -> (R, u32)
+    where
+        F: Fn(&Option<K>, &Option<V>) -> R,
+        R: Clone,
+    {
+        loop {
+            let v1 = self.version.load(AtomicOrdering::Acquire);
+            // If version is odd, a write is in progress - spin
+            if v1 % 2 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+
+            // Read the data
+            let result = f(unsafe { &*self.key.get() }, unsafe { &*self.value.get() });
+
+            // Ensure all reads complete before checking version
+            std::sync::atomic::fence(AtomicOrdering::Acquire);
+
+            // If version unchanged, we got a consistent read
+            if v1 == self.version.load(AtomicOrdering::Relaxed) {
+                return (result, v1);
+            }
+            // Version changed - retry
+        }
+    }
+}
+
+/// RAII guard for SeqLock write access.
+/// While held, the cell's version is odd (write in progress).
+/// On drop, increments version to even (stable).
+pub struct SeqLockWriteGuard<'a, K: Clone, V: Clone> {
+    cell: &'a Cell<K, V>,
+}
+
+impl<K: Clone, V: Clone> SeqLockWriteGuard<'_, K, V> {
+    /// Write new key and value to the cell.
+    /// Safety: This is safe because we hold exclusive write access.
+    pub fn write(&self, key: Option<K>, value: Option<V>) {
+        unsafe {
+            *self.cell.key.get() = key;
+            *self.cell.value.get() = value;
+        }
+    }
+
+    /// Get mutable reference to the key.
+    /// Safety: This is safe because we hold exclusive write access.
+    pub fn key_mut(&self) -> &mut Option<K> {
+        unsafe { &mut *self.cell.key.get() }
+    }
+
+    /// Get mutable reference to the value.
+    /// Safety: This is safe because we hold exclusive write access.
+    pub fn value_mut(&self) -> &mut Option<V> {
+        unsafe { &mut *self.cell.value.get() }
+    }
+}
+
+impl<K: Clone, V: Clone> Drop for SeqLockWriteGuard<'_, K, V> {
+    fn drop(&mut self) {
+        // Bump version from odd to even (release write lock)
+        self.cell.version.fetch_add(1, AtomicOrdering::Release);
+    }
 }
 
 impl<K, V> Default for Cell<K, V>
@@ -339,5 +461,170 @@ mod tests {
         cell.version.store(70000, AtomicOrdering::Release);
         let version = cell.version.load(AtomicOrdering::Acquire);
         assert_eq!(version, 70000, "Version should support values > u16::MAX");
+    }
+
+    // ==================== SeqLock Primitive Tests ====================
+
+    #[test]
+    fn test_begin_write_acquires_lock() {
+        let cell: Cell<u32, u32> = Cell::default();
+        assert_eq!(
+            cell.version.load(AtomicOrdering::Acquire) % 2,
+            0,
+            "Version should start even"
+        );
+
+        let _guard = cell.begin_write();
+        assert_eq!(
+            cell.version.load(AtomicOrdering::Acquire) % 2,
+            1,
+            "Version should be odd while write guard is held"
+        );
+    }
+
+    #[test]
+    fn test_write_guard_releases_on_drop() {
+        let cell: Cell<u32, u32> = Cell::default();
+        let initial_version = cell.version.load(AtomicOrdering::Acquire);
+        assert_eq!(initial_version, 0);
+
+        {
+            let _guard = cell.begin_write();
+            assert_eq!(cell.version.load(AtomicOrdering::Acquire), 1);
+        }
+
+        // After drop, version should be incremented to 2 (even again)
+        assert_eq!(cell.version.load(AtomicOrdering::Acquire), 2);
+        assert_eq!(
+            cell.version.load(AtomicOrdering::Acquire) % 2,
+            0,
+            "Version should be even after write guard dropped"
+        );
+    }
+
+    #[test]
+    fn test_write_guard_write_method() {
+        let cell: Cell<u32, String> = Cell::default();
+
+        {
+            let guard = cell.begin_write();
+            guard.write(Some(42), Some("hello".to_string()));
+        }
+
+        // Verify data was written
+        let (key, value) = cell.read_consistent(|k, v| (k.clone(), v.clone()));
+        assert_eq!(key, Some(42));
+        assert_eq!(value, Some("hello".to_string()));
+    }
+
+    #[test]
+    fn test_write_guard_key_mut_and_value_mut() {
+        let cell: Cell<u32, String> = Cell::default();
+
+        {
+            let guard = cell.begin_write();
+            *guard.key_mut() = Some(100);
+            *guard.value_mut() = Some("world".to_string());
+        }
+
+        let (key, value) = cell.read_consistent(|k, v| (k.clone(), v.clone()));
+        assert_eq!(key, Some(100));
+        assert_eq!(value, Some("world".to_string()));
+    }
+
+    #[test]
+    fn test_read_consistent_returns_stable_data() {
+        let cell: Cell<u32, u32> = Cell::default();
+
+        // Write some data
+        {
+            let guard = cell.begin_write();
+            guard.write(Some(123), Some(456));
+        }
+
+        // Read consistently
+        let (key, value) = cell.read_consistent(|k, v| (k.clone(), v.clone()));
+        assert_eq!(key, Some(123));
+        assert_eq!(value, Some(456));
+    }
+
+    #[test]
+    fn test_read_consistent_empty_cell() {
+        let cell: Cell<u32, u32> = Cell::default();
+
+        let (key, value) = cell.read_consistent(|k, v| (k.clone(), v.clone()));
+        assert_eq!(key, None);
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn test_read_with_version_returns_version() {
+        let cell: Cell<u32, u32> = Cell::default();
+
+        // Initial read
+        let ((key, value), version) = cell.read_with_version(|k, v| (k.clone(), v.clone()));
+        assert_eq!(key, None);
+        assert_eq!(value, None);
+        assert_eq!(version, 0);
+
+        // Write and read again
+        {
+            let guard = cell.begin_write();
+            guard.write(Some(42), Some(84));
+        }
+
+        let ((key, value), version) = cell.read_with_version(|k, v| (k.clone(), v.clone()));
+        assert_eq!(key, Some(42));
+        assert_eq!(value, Some(84));
+        assert_eq!(version, 2, "Version should be 2 after one write cycle");
+    }
+
+    #[test]
+    fn test_multiple_writes_increment_version() {
+        let cell: Cell<u32, u32> = Cell::default();
+
+        // First write
+        {
+            let guard = cell.begin_write();
+            guard.write(Some(1), Some(1));
+        }
+        assert_eq!(cell.version.load(AtomicOrdering::Acquire), 2);
+
+        // Second write
+        {
+            let guard = cell.begin_write();
+            guard.write(Some(2), Some(2));
+        }
+        assert_eq!(cell.version.load(AtomicOrdering::Acquire), 4);
+
+        // Third write
+        {
+            let guard = cell.begin_write();
+            guard.write(Some(3), Some(3));
+        }
+        assert_eq!(cell.version.load(AtomicOrdering::Acquire), 6);
+    }
+
+    #[test]
+    fn test_version_wrapping() {
+        let cell: Cell<u32, u32> = Cell::default();
+        // Set version close to u32::MAX (but even)
+        cell.version.store(u32::MAX - 1, AtomicOrdering::Release);
+
+        {
+            let _guard = cell.begin_write();
+            // Version should now be u32::MAX (odd)
+            assert_eq!(cell.version.load(AtomicOrdering::Acquire), u32::MAX);
+        }
+
+        // After drop, should wrap to 0
+        assert_eq!(cell.version.load(AtomicOrdering::Acquire), 0);
+    }
+
+    #[test]
+    fn test_seqlock_write_guard_is_send() {
+        fn assert_send<T: Send>() {}
+        // SeqLockWriteGuard should be Send if K and V are Send
+        assert_send::<SeqLockWriteGuard<'_, u32, u32>>();
     }
 }
