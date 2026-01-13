@@ -4,7 +4,7 @@ use std::cmp::{Ord, Ordering};
 use std::error::Error;
 use std::fmt::{self, Debug, Display};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicPtr, AtomicU16, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering as AtomicOrdering};
 
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, PartialOrd, Clone, Copy)]
@@ -65,14 +65,14 @@ impl<'a, T: Ord> From<&'a Key<T>> for Key<&'a T> {
 
 #[derive(Debug, Copy, Clone)]
 pub enum Marker<K: Clone, V: Clone> {
-    Empty(u16),
-    Move(u16, isize),
-    InsertCell(u16, K, V),
-    DeleteCell(u16, K),
+    Empty(u32),
+    Move(u32, isize),
+    InsertCell(u32, K, V),
+    DeleteCell(u32, K),
 }
 
 impl<K: Clone, V: Clone> Marker<K, V> {
-    pub fn version(&self) -> &u16 {
+    pub fn version(&self) -> &u32 {
         match self {
             Marker::Empty(v)
             | Marker::Move(v, _)
@@ -83,7 +83,7 @@ impl<K: Clone, V: Clone> Marker<K, V> {
 }
 
 pub struct Cell<K: Clone, V: Clone> {
-    pub version: AtomicU16,
+    pub version: AtomicU32, // SeqLock version (even = stable)
     pub marker: Option<AtomicPtr<Marker<K, V>>>,
     pub key: UnsafeCell<Option<K>>,
     pub value: UnsafeCell<Option<V>>,
@@ -95,7 +95,7 @@ unsafe impl<K: Clone, V: Clone> Sync for Cell<K, V> {}
 impl<K: Clone, V: Clone> Cell<K, V> {
     pub fn new(marker_ptr: *mut Marker<K, V>) -> Cell<K, V> {
         Cell {
-            version: AtomicU16::new(1),
+            version: AtomicU32::new(0), // even = stable
             marker: Some(AtomicPtr::new(marker_ptr)),
             key: UnsafeCell::new(None),
             value: UnsafeCell::new(None),
@@ -109,7 +109,7 @@ where
     V: Clone,
 {
     fn default() -> Self {
-        let marker = Box::new(Marker::<K, V>::Empty(1));
+        let marker = Box::new(Marker::<K, V>::Empty(0));
         let ptr = Box::into_raw(marker);
         Cell::new(ptr)
     }
@@ -151,7 +151,7 @@ pub struct CellData<K: Clone, V: Clone> {
 
 pub struct CellGuard<'a, K: 'a + Clone, V: 'a + Clone> {
     pub inner: &'a Cell<K, V>,
-    pub cache_version: u16,
+    pub cache_version: u32,
     pub is_filled: bool,
     cache_data: OnceCell<Option<CellData<K, V>>>,
     cache_marker_ptr: *mut Marker<K, V>,
@@ -301,5 +301,43 @@ impl<'a, K: Ord + Clone, V: Clone> Iterator for CellIterator<'a, K, V> {
 
         let guard = unsafe { CellGuard::from_raw(self.address) }.unwrap();
         Some(guard)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cell_default_version_is_zero_even() {
+        let cell: Cell<u32, u32> = Cell::default();
+        let version = cell.version.load(AtomicOrdering::Acquire);
+        assert_eq!(
+            version, 0,
+            "Cell should initialize with version 0 (even = stable)"
+        );
+        assert_eq!(version % 2, 0, "Version should be even (stable state)");
+    }
+
+    #[test]
+    fn test_cell_new_version_is_zero_even() {
+        let marker = Box::new(Marker::<u32, u32>::Empty(0));
+        let ptr = Box::into_raw(marker);
+        let cell: Cell<u32, u32> = Cell::new(ptr);
+        let version = cell.version.load(AtomicOrdering::Acquire);
+        assert_eq!(
+            version, 0,
+            "Cell::new should initialize with version 0 (even = stable)"
+        );
+        assert_eq!(version % 2, 0, "Version should be even (stable state)");
+    }
+
+    #[test]
+    fn test_version_can_hold_large_values() {
+        let cell: Cell<u32, u32> = Cell::default();
+        // Store a value larger than u16::MAX to verify u32 works
+        cell.version.store(70000, AtomicOrdering::Release);
+        let version = cell.version.load(AtomicOrdering::Acquire);
+        assert_eq!(version, 70000, "Version should support values > u16::MAX");
     }
 }
