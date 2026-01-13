@@ -18,14 +18,7 @@ unsafe impl<T> Sync for PackedMemoryArray<T> {}
 
 impl<T> PackedMemoryArray<T> {
     pub fn new(cells: Box<[T]>, capacity: usize) -> PackedMemoryArray<T> {
-        let left_buffer_space = cells.len() >> 2;
-
-        // TODO: Generalize this
-        let active_range = std::ops::Range {
-            start: &cells[left_buffer_space] as *const _,
-            end: &cells[cells.len() - left_buffer_space] as *const _,
-        };
-
+        let active_range = Self::compute_active_range(&cells);
         let density_scale = Self::compute_density_range(cells.len() as f32);
         let config = Config { density_scale };
 
@@ -49,6 +42,15 @@ impl<T> PackedMemoryArray<T> {
 
     pub fn is_valid_pointer(&self, ptr: &*const T) -> bool {
         self.active_range.contains(ptr)
+    }
+    /// Computes the active range of a slice, excluding buffer regions on both ends.
+    /// The buffer space is 1/4 of the total length on each side.
+    fn compute_active_range(cells: &[T]) -> Range<*const T> {
+        let buffer_space = cells.len() >> 2;
+        Range {
+            start: &cells[buffer_space] as *const _,
+            end: &cells[cells.len() - buffer_space] as *const _,
+        }
     }
 
     fn compute_density_range(cell_count: f32) -> Vec<Density> {
