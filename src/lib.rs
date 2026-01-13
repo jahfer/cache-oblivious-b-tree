@@ -33,9 +33,9 @@ mod tests {
         tree.insert(8, String::from("World"));
         tree.insert(12, String::from("!"));
 
-        assert_eq!(tree.get(&3), Some(&String::from("Hello")));
-        assert_eq!(tree.get(&8), Some(&String::from("World")));
-        assert_eq!(tree.get(&12), Some(&String::from("!")));
+        assert_eq!(tree.get(&3), Some(String::from("Hello")));
+        assert_eq!(tree.get(&8), Some(String::from("World")));
+        assert_eq!(tree.get(&12), Some(String::from("!")));
     }
 
     #[test]
@@ -45,10 +45,10 @@ mod tests {
         tree.insert(3, String::from("World"));
         tree.insert(2, String::from("!"));
 
-        assert_eq!(tree.get(&5), Some(&String::from("Hello")));
+        assert_eq!(tree.get(&5), Some(String::from("Hello")));
         assert_eq!(tree.get(&4), None);
-        assert_eq!(tree.get(&3), Some(&String::from("World")));
-        assert_eq!(tree.get(&2), Some(&String::from("!")));
+        assert_eq!(tree.get(&3), Some(String::from("World")));
+        assert_eq!(tree.get(&2), Some(String::from("!")));
     }
 
     #[test]
@@ -58,6 +58,6 @@ mod tests {
             tree.insert(i, i + 1);
         }
 
-        assert_eq!(tree.get(&99), Some(&100));
+        assert_eq!(tree.get(&99), Some(100));
     }
 }

@@ -60,7 +60,7 @@ where
         BTreeMap { index, data }
     }
 
-    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    pub fn get<Q>(&self, key: &Q) -> Option<V>
     where
         Q: Ord,
         K: Borrow<Q>,
@@ -458,7 +458,7 @@ where
         self.index_tree.find(search_key, true)
     }
 
-    pub fn get<'a, Q>(&self, search_key: &Q) -> Option<&'a V>
+    pub fn get<Q>(&self, search_key: &Q) -> Option<V>
     where
         Q: Ord,
         K: Borrow<Q>,
@@ -473,10 +473,7 @@ where
                         let cache = cell_guard.cache().unwrap().clone().unwrap();
                         let cache_key = cache.key.borrow();
                         if cache_key == search_key {
-                            // todo: ABA problem
-                            let value =
-                                unsafe { (&*cell_guard.inner.value.get()).as_ref().unwrap() };
-                            return Some(value);
+                            return Some(cache.value);
                         } else if cache_key > search_key {
                             return None;
                         }
@@ -2111,7 +2108,7 @@ mod tests {
         let result = btree.get(&10);
         assert_eq!(
             result,
-            Some(&100),
+            Some(100),
             "Value should be retrievable immediately after insert"
         );
     }
@@ -2128,9 +2125,9 @@ mod tests {
         btree.insert(12, 120);
 
         // All values should be retrievable immediately
-        assert_eq!(btree.get(&3), Some(&30));
-        assert_eq!(btree.get(&8), Some(&80));
-        assert_eq!(btree.get(&12), Some(&120));
+        assert_eq!(btree.get(&3), Some(30));
+        assert_eq!(btree.get(&8), Some(80));
+        assert_eq!(btree.get(&12), Some(120));
 
         // Non-existent key should return None
         assert_eq!(btree.get(&7), None);
@@ -2161,7 +2158,7 @@ mod tests {
 
         // Verify all values are retrievable
         for i in 0..5 {
-            assert_eq!(btree.get(&i), Some(&(i * 10)));
+            assert_eq!(btree.get(&i), Some(i * 10));
         }
     }
 
@@ -2178,12 +2175,7 @@ mod tests {
 
         // All values should be retrievable
         for i in 0..20 {
-            assert_eq!(
-                btree.get(&i),
-                Some(&(i * 100)),
-                "Failed to retrieve key {}",
-                i
-            );
+            assert_eq!(btree.get(&i), Some(i * 100), "Failed to retrieve key {}", i);
         }
     }
 
@@ -2199,9 +2191,9 @@ mod tests {
         btree.insert(2, 20);
 
         // All values should be retrievable
-        assert_eq!(btree.get(&5), Some(&50));
-        assert_eq!(btree.get(&3), Some(&30));
-        assert_eq!(btree.get(&2), Some(&20));
+        assert_eq!(btree.get(&5), Some(50));
+        assert_eq!(btree.get(&3), Some(30));
+        assert_eq!(btree.get(&2), Some(20));
     }
 
     #[test]
@@ -2242,7 +2234,7 @@ mod tests {
         for i in 0..15 {
             assert_eq!(
                 btree.get(&i),
-                Some(&i),
+                Some(i),
                 "Value lost after rebalancing for key {}",
                 i
             );
@@ -2316,12 +2308,12 @@ mod tests {
         for i in 0..num_inserts {
             assert_eq!(
                 small_tree.get(&(i * 2 + 1)),
-                Some(&i),
+                Some(i),
                 "Small tree missing inserted key"
             );
             assert_eq!(
                 large_tree.get(&(i * 2 + 1)),
-                Some(&i),
+                Some(i),
                 "Large tree missing inserted key"
             );
         }
