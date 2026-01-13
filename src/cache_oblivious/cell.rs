@@ -273,7 +273,7 @@ pub struct CellData<K: Clone, V: Clone> {
 
 pub struct CellGuard<'a, K: 'a + Clone, V: 'a + Clone> {
     pub inner: &'a Cell<K, V>,
-    pub cache_version: u32,
+    pub cached_version: u32,
     pub is_filled: bool,
     cache_data: OnceCell<Option<CellData<K, V>>>,
     cache_marker_ptr: *mut Marker<K, V>,
@@ -285,27 +285,31 @@ impl<K: Clone, V: Clone> CellGuard<'_, K, V> {
         !self.is_filled
     }
 
+    /// Returns true if the cell has been modified since this guard was created.
+    pub fn is_stale(&self) -> bool {
+        self.inner.version.load(AtomicOrdering::Acquire) != self.cached_version
+    }
+
     pub fn cache(&self) -> Result<&Option<CellData<K, V>>, CellReadError> {
         // Manual implementation of get_or_try_init for stable Rust
         if let Some(cached) = self.cache_data.get() {
             return Ok(cached);
         }
 
-        let version = self.inner.version.load(AtomicOrdering::SeqCst);
+        // Check if the cell has been modified since the guard was created
+        if self.is_stale() {
+            return Err(CellReadError {});
+        }
+
+        // Get marker and validate version consistency
         let current_marker_raw = self
             .inner
             .marker
             .as_ref()
             .unwrap()
-            .load(AtomicOrdering::SeqCst);
+            .load(AtomicOrdering::Acquire);
 
-        // Check version consistency BEFORE cloning any data
-        let marker_version = unsafe { *(*current_marker_raw).version() };
-        if version != marker_version {
-            return Err(CellReadError {});
-        }
-
-        // Only clone after validation passes
+        // Read key and value
         let key = unsafe { (*self.inner.key.get()).clone() };
         let result = if let Some(k) = key {
             let value = unsafe { (*self.inner.value.get()).clone() };
@@ -318,6 +322,11 @@ impl<K: Clone, V: Clone> CellGuard<'_, K, V> {
         } else {
             None
         };
+
+        // Validate against cached_version after the read
+        if self.is_stale() {
+            return Err(CellReadError {});
+        }
 
         // set() will fail if already set (race condition), but get() will return the value
         let _ = self.cache_data.set(result);
@@ -370,16 +379,20 @@ impl Error for CellWriteError {}
 impl<'a, K: Clone, V: Clone> CellGuard<'a, K, V> {
     pub unsafe fn from_raw(ptr: *const Cell<K, V>) -> Result<CellGuard<'a, K, V>, Box<dyn Error>> {
         let cell = &*ptr;
-        let version = cell.version.load(AtomicOrdering::SeqCst);
-        let key = (*cell.key.get()).clone();
-        let current_marker_raw = cell.marker.as_ref().unwrap().load(AtomicOrdering::SeqCst);
 
-        // TODO: Check version in marker to make sure the cell was not modified in between
+        // Load the version for staleness checks
+        let observed_version = cell.version.load(AtomicOrdering::Acquire);
+
+        // Read is_filled state
+        let key = (*cell.key.get()).clone();
+        let is_filled = key.is_some();
+
+        let current_marker_raw = cell.marker.as_ref().unwrap().load(AtomicOrdering::Acquire);
 
         Ok(CellGuard {
             inner: cell,
-            is_filled: key.is_some(),
-            cache_version: version,
+            is_filled,
+            cached_version: observed_version,
             cache_marker_ptr: current_marker_raw,
             cache_data: OnceCell::new(),
             _phantom: PhantomData,
@@ -626,5 +639,106 @@ mod tests {
         fn assert_send<T: Send>() {}
         // SeqLockWriteGuard should be Send if K and V are Send
         assert_send::<SeqLockWriteGuard<'_, u32, u32>>();
+    }
+
+    // ==================== CellGuard Step 3 Tests ====================
+
+    #[test]
+    fn test_cell_guard_cached_version_is_u32() {
+        let cell: Cell<u32, u32> = Cell::default();
+        let guard = unsafe { CellGuard::from_raw(&cell as *const _) }.unwrap();
+        // cached_version should be the same as the cell's version
+        assert_eq!(guard.cached_version, 0);
+    }
+
+    #[test]
+    fn test_cell_guard_is_stale_returns_false_when_unchanged() {
+        let cell: Cell<u32, u32> = Cell::default();
+        let guard = unsafe { CellGuard::from_raw(&cell as *const _) }.unwrap();
+        assert!(
+            !guard.is_stale(),
+            "Guard should not be stale when cell is unchanged"
+        );
+    }
+
+    #[test]
+    fn test_cell_guard_is_stale_returns_true_after_write() {
+        let cell: Cell<u32, u32> = Cell::default();
+        let guard = unsafe { CellGuard::from_raw(&cell as *const _) }.unwrap();
+
+        // Perform a write which changes the version
+        {
+            let write_guard = cell.begin_write();
+            write_guard.write(Some(42), Some(84));
+        }
+
+        // Now the guard should be stale
+        assert!(
+            guard.is_stale(),
+            "Guard should be stale after cell was modified"
+        );
+    }
+
+    #[test]
+    fn test_cell_guard_is_stale_detects_version_change() {
+        let cell: Cell<u32, u32> = Cell::default();
+        let guard = unsafe { CellGuard::from_raw(&cell as *const _) }.unwrap();
+
+        // Manually change the version to simulate a concurrent write
+        cell.version.store(10, AtomicOrdering::Release);
+
+        assert!(guard.is_stale(), "Guard should detect version mismatch");
+    }
+
+    #[test]
+    fn test_cell_guard_from_raw_captures_version() {
+        let cell: Cell<u32, u32> = Cell::default();
+
+        // Do some writes to change the version
+        {
+            let write_guard = cell.begin_write();
+            write_guard.write(Some(1), Some(2));
+        }
+        // Version is now 2
+
+        let guard = unsafe { CellGuard::from_raw(&cell as *const _) }.unwrap();
+        assert_eq!(
+            guard.cached_version, 2,
+            "Guard should capture current version"
+        );
+        assert!(!guard.is_stale(), "New guard should not be stale");
+    }
+
+    #[test]
+    fn test_cell_guard_is_filled_correct() {
+        let cell: Cell<u32, u32> = Cell::default();
+
+        // Empty cell
+        let guard = unsafe { CellGuard::from_raw(&cell as *const _) }.unwrap();
+        assert!(
+            guard.is_empty(),
+            "Guard for empty cell should report is_empty=true"
+        );
+        assert!(
+            !guard.is_filled,
+            "Guard for empty cell should have is_filled=false"
+        );
+
+        // Write data
+        {
+            let write_guard = cell.begin_write();
+            write_guard.write(Some(42), Some(84));
+        }
+
+        // Filled cell
+        let guard2 = unsafe { CellGuard::from_raw(&cell as *const _) }.unwrap();
+        assert!(
+            !guard2.is_empty(),
+            "Guard for filled cell should report is_empty=false"
+        );
+        assert!(
+            guard2.is_filled,
+            "Guard for filled cell should have is_filled=true"
+        );
     }
 }

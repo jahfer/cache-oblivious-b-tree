@@ -25,28 +25,56 @@ Replace the marker-based protocol with a pure SeqLock pattern using `AtomicU32`.
    - ~~`read_consistent<F, R>(f: F) -> R` — loop until stable read~~
    - ~~`SeqLockWriteGuard` — RAII guard that bumps version to even on drop~~
 
-3. **Update `CellGuard`** in [cell.rs#L150-L160](src/cache_oblivious/cell.rs#L150-L160):
+3. ~~**Update `CellGuard`** in [cell.rs#L150-L160](src/cache_oblivious/cell.rs#L150-L160):~~
 
-   - Replace `cache_version: u16` with `cached_version: u32`
-   - Remove `cache_marker_ptr` field
-   - Add `is_stale() -> bool` method to check if cell changed since guard creation
-   - `cache()` calls `Cell::read_consistent()` and validates against `cached_version`
+   - ~~Replace `cache_version: u16` with `cached_version: u32`~~
+   - ~~Add `is_stale() -> bool` method to check if cell changed since guard creation~~
+   - ~~`cache()` validates against `cached_version` before/after reading~~
+   - ~~`from_raw()` captures version at guard creation~~
+   - _Note: `cache_marker_ptr` kept temporarily for backward compatibility with `update()`_
 
-4. **Update `CellGuard::from_raw()`** in [cell.rs#L236-L254](src/cache_oblivious/cell.rs#L236-L254):
+### Remaining Steps (Revised)
 
-   - Use `read_consistent()` to safely read `is_filled` state
-   - Store the observed version in `cached_version`
+The following steps remove marker-based logic incrementally. Each step should result in a passing test suite.
 
-5. **Simplify `Cell::new()` and `Default`** — no marker allocation needed.
+4. **Update write sites in `btree_map.rs` to use `begin_write()`**:
 
-6. **Remove `Drop` impl for `Cell`** — no marker pointer to deallocate.
+   - Find all `cell.inner.key.get().write()` / `cell.inner.value.get().write()` calls
+   - Wrap each write with `cell.inner.begin_write()` guard
+   - Keep marker logic in parallel for now (dual-write) to maintain compatibility
+   - Update version bump logic to rely on `SeqLockWriteGuard` drop
 
-7. **Update write sites in `btree_map.rs`**:
+5. **Remove `CellGuard::update()` method**:
 
-   - Wrap all `cell.key.get()` / `cell.value.get()` writes with `begin_write()` guard
-   - Remove any marker CAS logic
+   - After Step 4, marker CAS is no longer needed for correctness
+   - Remove the `update()` method from `CellGuard`
+   - Remove `cache_marker_ptr` field from `CellGuard`
+   - Update any call sites that used `update()` to use `begin_write()` directly
 
-8. **Remove `Marker` enum and all marker-related fields** from `Cell`, `CellData`, and `CellGuard`.
+6. **Remove `marker` field from `CellData`**:
+
+   - `CellData` should only contain `key` and `value`
+   - Update `cache()` method to not read/store marker
+   - Remove marker cloning in `cache()`
+
+7. **Remove `marker` field from `Cell`**:
+
+   - Remove `marker: Option<AtomicPtr<Marker<K, V>>>` from `Cell` struct
+   - Simplify `Cell::new()` — no marker allocation needed
+   - Simplify `Default` impl — no marker allocation needed
+   - Remove `Drop` impl for `Cell` — no marker pointer to deallocate
+
+8. **Remove `Marker<K, V>` enum**:
+
+   - Delete the `Marker` enum definition
+   - Remove any remaining marker-related imports or dead code
+   - Clean up `Debug` impl for `Cell` if it references markers
+
+9. **Final cleanup**:
+
+   - Remove any `#[allow(dead_code)]` that was added during transition
+   - Verify no marker-related code remains
+   - Update documentation/comments to reflect SeqLock-only approach
 
 ### Simplified Structures
 

@@ -120,7 +120,7 @@ where
                     }
                 }
 
-                let marker_version = cell_guard.cache_version + 1;
+                let marker_version = cell_guard.cached_version + 1;
                 let cell = selected_cell.as_mut().unwrap_or(&mut cell_guard);
 
                 let marker = Marker::InsertCell(marker_version, key.clone(), value.clone());

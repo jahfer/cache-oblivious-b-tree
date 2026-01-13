@@ -68,3 +68,44 @@
 - SeqLock primitives are now available but not yet integrated into existing code
 - All 72 tests pass (65 previous + 7 new SeqLock tests)
 - Next step: Update `CellGuard` to use SeqLock primitives (replace `cache_version: u16` with `cached_version: u32`, remove `cache_marker_ptr`, add `is_stale()` method)
+
+---
+
+## Step 3: Update `CellGuard` with SeqLock support (Completed)
+
+**Date:** January 12, 2026
+
+**Changes made:**
+
+- Renamed `cache_version` to `cached_version` in `CellGuard` struct (clearer naming)
+- Added `is_stale() -> bool` method to `CellGuard`
+  - Returns `true` if cell's version differs from `cached_version`
+  - Useful for detecting concurrent modifications
+- Updated `cache()` method to validate against `cached_version`
+  - Checks `is_stale()` before and after reading data
+  - Returns `CellReadError` if staleness detected
+- Updated `from_raw()` to capture version using `Acquire` ordering
+- Updated `btree_map.rs` to use `cached_version` instead of `cache_version`
+
+**Note:** `cache_marker_ptr` field was NOT removed in this step
+
+- The `update()` method still depends on `cache_marker_ptr` for marker CAS logic
+- This will be addressed in Step 7 when marker-based writes are replaced with SeqLock writes
+- Conservative approach avoids breaking existing functionality
+
+**Tests added:**
+
+- `test_cell_guard_cached_version_is_u32` - verifies cached_version field exists and is initialized correctly
+- `test_cell_guard_is_stale_returns_false_when_unchanged` - verifies is_stale() returns false for unchanged cells
+- `test_cell_guard_is_stale_returns_true_after_write` - verifies is_stale() detects writes via begin_write()
+- `test_cell_guard_is_stale_detects_version_change` - verifies is_stale() detects manual version changes
+- `test_cell_guard_from_raw_captures_version` - verifies from_raw() captures current version
+- `test_cell_guard_is_filled_correct` - verifies is_filled/is_empty work correctly with SeqLock writes
+
+**Notes for next contributor:**
+
+- CellGuard now has `is_stale()` for detecting concurrent modifications
+- The field is now `cached_version` (was `cache_version`)
+- `cache_marker_ptr` still exists temporarily for backward compatibility with `update()` method
+- All 78 tests pass (72 previous + 6 new CellGuard tests)
+- Next step: Update `CellGuard::from_raw()` to use `read_consistent()` (Step 4)
