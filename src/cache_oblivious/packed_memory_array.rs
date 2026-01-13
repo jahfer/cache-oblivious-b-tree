@@ -263,4 +263,39 @@ mod tests {
         assert_eq!(size, 4294967296); // 2^32
         assert!(size >= 10000);
     }
+
+    #[test]
+    fn compute_active_range_excludes_buffer_regions() {
+        // Create a slice of length 8; buffer_space = 8 >> 2 = 2
+        // Active range should be indices [2, 6) (elements at indices 2, 3, 4, 5)
+        let cells: Vec<i32> = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let range = PackedMemoryArray::<i32>::compute_active_range(&cells);
+
+        // Verify start points to index 2
+        assert_eq!(range.start, &cells[2] as *const i32);
+        // Verify end points to index 6 (one past the last active element)
+        assert_eq!(range.end, &cells[6] as *const i32);
+
+        // Verify the values at the boundaries
+        unsafe {
+            assert_eq!(*range.start, 2);
+            assert_eq!(*range.end, 6);
+        }
+    }
+
+    #[test]
+    fn compute_active_range_with_larger_slice() {
+        // Create a slice of length 16; buffer_space = 16 >> 2 = 4
+        // Active range should be indices [4, 12)
+        let cells: Vec<i32> = (0..16).collect();
+        let range = PackedMemoryArray::<i32>::compute_active_range(&cells);
+
+        assert_eq!(range.start, &cells[4] as *const i32);
+        assert_eq!(range.end, &cells[12] as *const i32);
+
+        unsafe {
+            assert_eq!(*range.start, 4);
+            assert_eq!(*range.end, 12);
+        }
+    }
 }
