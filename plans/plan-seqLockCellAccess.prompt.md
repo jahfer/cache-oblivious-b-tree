@@ -37,12 +37,12 @@ Replace the marker-based protocol with a pure SeqLock pattern using `AtomicU32`.
 
 The following steps remove marker-based logic incrementally. Each step should result in a passing test suite.
 
-4. **Update write sites in `btree_map.rs` to use `begin_write()`**:
+4. ~~**Update write sites in `btree_map.rs` to use `begin_write()`**:~~
 
-   - Find all `cell.inner.key.get().write()` / `cell.inner.value.get().write()` calls
-   - Wrap each write with `cell.inner.begin_write()` guard
-   - Keep marker logic in parallel for now (dual-write) to maintain compatibility
-   - Update version bump logic to rely on `SeqLockWriteGuard` drop
+   - ~~Find all `cell.inner.key.get().write()` / `cell.inner.value.get().write()` calls~~
+   - ~~Wrap each write with `cell.inner.begin_write()` guard~~
+   - ~~Keep marker logic in parallel for now (dual-write) to maintain compatibility~~
+   - ~~Update version bump logic to rely on `SeqLockWriteGuard` drop~~
 
 5. **Remove `CellGuard::update()` method**:
 

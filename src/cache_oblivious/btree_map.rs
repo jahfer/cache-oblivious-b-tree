@@ -134,27 +134,32 @@ where
 
                 let prev_marker = result.unwrap();
 
-                // We now have exclusive access to the cell until we update `version`.
-                // This works well for mutating through UnsafeCell<T>, but isn't really
-                // "lock-free"...
-                unsafe {
-                    cell.inner.key.get().write(Some(key));
-                    cell.inner.value.get().write(Some(value));
-                };
+                // Acquire SeqLock write guard for exclusive access
+                // The guard sets version to odd (write in progress) and
+                // will bump it back to even on drop
+                {
+                    let _write_guard = cell.inner.begin_write();
+                    // Write key/value through the guard's cell reference
+                    // Safety: We have exclusive write access via SeqLock
+                    unsafe {
+                        (*cell.inner.key.get()) = Some(key);
+                        (*cell.inner.value.get()) = Some(value);
+                    }
+                    // _write_guard drops here, incrementing version to even
+                }
 
                 // Track the cell where we inserted for index update
                 inserted_cell_ptr = Some(cell.inner as *const Cell<K, V>);
 
-                let next_version = marker_version + 1;
+                let next_version = cell.inner.version.load(Ordering::Acquire);
 
-                // Reuse previous marker allocation
+                // Reuse previous marker allocation (marker logic kept for compatibility)
                 unsafe { prev_marker.write(Marker::Empty(next_version)) };
                 cell.inner
                     .marker
                     .as_ref()
                     .unwrap()
                     .swap(prev_marker, Ordering::SeqCst);
-                cell.inner.version.swap(next_version, Ordering::SeqCst);
 
                 break;
             }
@@ -305,33 +310,57 @@ where
                 todo!("Restart rebalance!");
             }
 
-            unsafe {
-                // update new cell
-                cell.key.get().write((*cell_to_move.key.get()).clone());
-                cell.value.get().write((*cell_to_move.value.get()).clone());
-                // todo update version and marker of new cell?
+            // Clone data before acquiring locks to minimize lock duration
+            let key_to_write = unsafe { (*cell_to_move.key.get()).clone() };
+            let value_to_write = unsafe { (*cell_to_move.value.get()).clone() };
 
-                // update old cell
-                cell_to_move.key.get().write(None);
-                cell_to_move.value.get().write(None);
-                let new_version = version + 1;
-                // reuse prev_marker box
+            // Acquire SeqLock write guard for destination cell
+            {
+                let _dest_guard = cell.begin_write();
+                // Write cloned key/value to destination cell
+                unsafe {
+                    (*cell.key.get()) = key_to_write;
+                    (*cell.value.get()) = value_to_write;
+                }
+                // _dest_guard drops here, incrementing destination version
+            }
+
+            // Update destination cell's marker to match its new version (dual-write for compatibility)
+            let dest_new_version = cell.version.load(Ordering::Acquire);
+            let dest_marker = Box::new(Marker::Empty(dest_new_version));
+            let dest_marker_raw = Box::into_raw(dest_marker);
+            let dest_old_marker = cell
+                .marker
+                .as_ref()
+                .unwrap()
+                .swap(dest_marker_raw, Ordering::SeqCst);
+            // Deallocate the old marker
+            unsafe { drop(Box::from_raw(dest_old_marker)) };
+
+            // Acquire SeqLock write guard for source cell (cell_to_move)
+            {
+                let _src_guard = cell_to_move.begin_write();
+                // Clear source cell
+                unsafe {
+                    (*cell_to_move.key.get()) = None;
+                    (*cell_to_move.value.get()) = None;
+                }
+                // _src_guard drops here, incrementing source version
+            }
+
+            // Update marker logic (kept for compatibility during transition)
+            let new_version = cell_to_move.version.load(Ordering::Acquire);
+            // reuse prev_marker box
+            unsafe {
                 prev_marker.unwrap().write(Marker::Empty(new_version));
-                // use compare_exchange_weak because we can safely fail here
-                let _ = cell_to_move.marker.as_ref().unwrap().compare_exchange_weak(
-                    new_marker_raw,
-                    prev_marker.unwrap(),
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                );
-                let _ = cell_to_move.version.compare_exchange_weak(
-                    marker_version,
-                    new_version,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                );
-                // TODO: increment version, clear marker
-            };
+            }
+            // use compare_exchange_weak because we can safely fail here
+            let _ = cell_to_move.marker.as_ref().unwrap().compare_exchange_weak(
+                new_marker_raw,
+                prev_marker.unwrap(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
 
             current_cell_ptr = unsafe { current_cell_ptr.sub(1) };
             if self.data.is_valid_pointer(&current_cell_ptr) {
@@ -2315,6 +2344,132 @@ mod tests {
                 large_tree.get(&(i * 2 + 1)),
                 Some(i),
                 "Large tree missing inserted key"
+            );
+        }
+    }
+
+    // === Step 4 tests: SeqLock integration in write sites ===
+
+    #[test]
+    fn test_insert_uses_seqlock_for_writes() {
+        // Test that insert uses SeqLock and keeps version/marker in sync
+        let mut btree: BTreeMap<u32, u32> = BTreeMap::new(16);
+
+        // Insert a value
+        btree.insert(10, 100);
+
+        // The cell should have an even version (stable state after SeqLock write)
+        // and the marker version should match
+        let cells = btree.data.as_slice();
+        let mut found_cell = false;
+
+        for cell in cells.iter() {
+            let key = unsafe { (*cell.key.get()).clone() };
+            if key == Some(10) {
+                found_cell = true;
+                let version = cell.version.load(Ordering::Acquire);
+                let marker_ptr = cell.marker.as_ref().unwrap().load(Ordering::Acquire);
+                let marker_version = unsafe { *(*marker_ptr).version() };
+
+                // Version should be even (stable state)
+                assert_eq!(
+                    version % 2,
+                    0,
+                    "Cell version should be even (stable) after insert"
+                );
+                // Marker version should match cell version
+                assert_eq!(
+                    version, marker_version,
+                    "Cell version and marker version should match after insert"
+                );
+                break;
+            }
+        }
+
+        assert!(found_cell, "Should find the inserted cell");
+    }
+
+    #[test]
+    fn test_rebalance_updates_both_cell_markers() {
+        // Test that rebalance updates markers for both source and destination cells
+        let mut btree: BTreeMap<u32, u32> = BTreeMap::new(16);
+
+        // Insert values in reverse order to trigger rebalancing
+        btree.insert(5, 50);
+        btree.insert(3, 30);
+        btree.insert(1, 10);
+
+        // All cells should have matching version and marker
+        let cells = btree.data.as_slice();
+        for cell in cells.iter() {
+            let version = cell.version.load(Ordering::Acquire);
+            let marker_ptr = cell.marker.as_ref().unwrap().load(Ordering::Acquire);
+            let marker_version = unsafe { *(*marker_ptr).version() };
+
+            // Version should be even (stable state)
+            assert_eq!(
+                version % 2,
+                0,
+                "All cells should have even version (stable state)"
+            );
+            // Marker version should match cell version
+            assert_eq!(
+                version, marker_version,
+                "Cell version {} should match marker version {}",
+                version, marker_version
+            );
+        }
+
+        // Verify data integrity
+        assert_eq!(btree.get(&1), Some(10));
+        assert_eq!(btree.get(&3), Some(30));
+        assert_eq!(btree.get(&5), Some(50));
+    }
+
+    #[test]
+    fn test_seqlock_version_increments_by_two_per_write() {
+        // Each SeqLock write cycle increments version by 2 (odd then even)
+        let mut btree: BTreeMap<u32, u32> = BTreeMap::new(16);
+
+        // Insert first value
+        btree.insert(10, 100);
+
+        // Find the cell and check its version
+        let cells = btree.data.as_slice();
+        let mut cell_version_after_first = 0u32;
+        let mut cell_ptr: Option<*const Cell<u32, u32>> = None;
+
+        for cell in cells.iter() {
+            let key = unsafe { (*cell.key.get()).clone() };
+            if key == Some(10) {
+                cell_version_after_first = cell.version.load(Ordering::Acquire);
+                cell_ptr = Some(cell as *const _);
+                break;
+            }
+        }
+
+        // First insert: version should be 2 (0 -> 1 -> 2)
+        assert_eq!(
+            cell_version_after_first, 2,
+            "After first insert, version should be 2"
+        );
+
+        // Now if we could write to the same cell again, version would be 4
+        // But since we're using a map, inserting the same key would overwrite
+        // Let's verify the SeqLock mechanism directly
+        if let Some(ptr) = cell_ptr {
+            let cell = unsafe { &*ptr };
+            // Manually use begin_write to verify increment behavior
+            {
+                let _guard = cell.begin_write();
+                let during_write = cell.version.load(Ordering::Acquire);
+                assert_eq!(during_write % 2, 1, "During write, version should be odd");
+            }
+            let after_write = cell.version.load(Ordering::Acquire);
+            assert_eq!(
+                after_write,
+                cell_version_after_first + 2,
+                "After another write cycle, version should increment by 2"
             );
         }
     }

@@ -108,4 +108,38 @@
 - The field is now `cached_version` (was `cache_version`)
 - `cache_marker_ptr` still exists temporarily for backward compatibility with `update()` method
 - All 78 tests pass (72 previous + 6 new CellGuard tests)
-- Next step: Update `CellGuard::from_raw()` to use `read_consistent()` (Step 4)
+- Next step: Update write sites in `btree_map.rs` to use `begin_write()` (Step 4)
+
+---
+
+## Step 4: Update write sites to use `begin_write()` (Completed)
+
+**Date:** January 12, 2026
+
+**Changes made:**
+
+- Updated `insert()` method in [btree_map.rs](../src/cache_oblivious/btree_map.rs):
+  - Wrapped key/value writes with `begin_write()` SeqLock guard
+  - Version is now managed by SeqLockWriteGuard (increments on drop)
+  - Marker is updated after write with the new version for compatibility
+- Updated `rebalance()` method in [btree_map.rs](../src/cache_oblivious/btree_map.rs):
+  - Wrapped destination cell writes with `begin_write()` guard
+  - Wrapped source cell clearing with `begin_write()` guard
+  - **Critical fix:** Added marker update for destination cell to keep version/marker in sync
+  - Source cell marker is also updated with new version after SeqLock write
+
+**Key insight:** During dual-write transition, both source AND destination cells need their markers updated after SeqLock writes. Otherwise, subsequent rebalance operations fail the `version != marker_version` check.
+
+**Tests added:**
+
+- `test_insert_uses_seqlock_for_writes` - verifies insert uses SeqLock and keeps version/marker in sync
+- `test_rebalance_updates_both_cell_markers` - verifies rebalance updates markers for both source and destination
+- `test_seqlock_version_increments_by_two_per_write` - verifies SeqLock increments version by 2 per write cycle
+
+**Notes for next contributor:**
+
+- All write operations now use SeqLock for exclusive access
+- Marker logic is kept in parallel (dual-write) for backward compatibility
+- Version management is now handled by SeqLockWriteGuard drop
+- All 81 tests pass (78 previous + 3 new Step 4 tests)
+- Next step: Remove `CellGuard::update()` method (Step 5) - marker CAS is no longer needed for correctness
