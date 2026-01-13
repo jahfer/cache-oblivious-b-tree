@@ -109,57 +109,57 @@ where
                         if result.has_affected_blocks() {
                             affected_blocks.push(result.affected_blocks);
                         }
+                        // After rebalance, the cell is now empty and has a new version.
+                        // Refresh cached_version so try_begin_write will succeed.
+                        cell_guard.cached_version =
+                            cell_guard.inner.version.load(Ordering::Acquire);
                     }
                 }
 
-                if let Some(cell_to_move) = &selected_cell {
+                if let Some(cell_to_move) = &mut selected_cell {
                     // move cell to make room for insert
                     let result = self.rebalance(cell_to_move.inner, true);
                     if result.has_affected_blocks() {
                         affected_blocks.push(result.affected_blocks);
                     }
+                    // After rebalance, the cell is now empty and has a new version.
+                    // Refresh cached_version so try_begin_write will succeed.
+                    cell_to_move.cached_version =
+                        cell_to_move.inner.version.load(Ordering::Acquire);
                 }
 
-                let marker_version = cell_guard.cached_version + 1;
                 let cell = selected_cell.as_mut().unwrap_or(&mut cell_guard);
 
-                let marker = Marker::InsertCell(marker_version, key.clone(), value.clone());
-
-                let result = cell.update(marker);
-
-                if result.is_err() {
-                    // Marker has been updated by another process, start loop over
-                    continue;
-                }
-
-                let prev_marker = result.unwrap();
-
-                // Acquire SeqLock write guard for exclusive access
-                // The guard sets version to odd (write in progress) and
-                // will bump it back to even on drop
-                {
-                    let _write_guard = cell.inner.begin_write();
-                    // Write key/value through the guard's cell reference
-                    // Safety: We have exclusive write access via SeqLock
-                    unsafe {
-                        (*cell.inner.key.get()) = Some(key);
-                        (*cell.inner.value.get()) = Some(value);
+                // Try to acquire exclusive write access using SeqLock.
+                // This only succeeds if the cell's version matches cached_version,
+                // providing atomic claim behavior (replaces marker CAS from update()).
+                let write_guard = match cell.inner.try_begin_write(cell.cached_version) {
+                    Some(guard) => guard,
+                    None => {
+                        // Cell has been modified by another process, start loop over
+                        continue;
                     }
-                    // _write_guard drops here, incrementing version to even
+                };
+
+                // Write key/value through the guard's cell reference
+                // Safety: We have exclusive write access via SeqLock
+                unsafe {
+                    (*cell.inner.key.get()) = Some(key);
+                    (*cell.inner.value.get()) = Some(value);
                 }
+
+                // Drop the guard to release the lock (increments version to even)
+                drop(write_guard);
 
                 // Track the cell where we inserted for index update
                 inserted_cell_ptr = Some(cell.inner as *const Cell<K, V>);
 
                 let next_version = cell.inner.version.load(Ordering::Acquire);
 
-                // Reuse previous marker allocation (marker logic kept for compatibility)
-                unsafe { prev_marker.write(Marker::Empty(next_version)) };
-                cell.inner
-                    .marker
-                    .as_ref()
-                    .unwrap()
-                    .swap(prev_marker, Ordering::SeqCst);
+                // Update marker to match new version (marker logic kept for compatibility)
+                let current_marker_raw =
+                    cell.inner.marker.as_ref().unwrap().load(Ordering::Acquire);
+                unsafe { (*current_marker_raw) = Marker::Empty(next_version) };
 
                 break;
             }

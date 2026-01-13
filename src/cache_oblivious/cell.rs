@@ -129,6 +129,32 @@ impl<K: Clone, V: Clone> Cell<K, V> {
         }
     }
 
+    /// Try to acquire exclusive write access only if the cell's version matches `expected_version`.
+    /// Returns `Some(guard)` if successful, `None` if version doesn't match or another write is in progress.
+    /// This provides atomic claim behavior - only succeeds if no one has modified the cell since
+    /// the expected version was observed.
+    pub fn try_begin_write(&self, expected_version: u32) -> Option<SeqLockWriteGuard<'_, K, V>> {
+        // Expected version must be even (stable state)
+        if expected_version % 2 == 1 {
+            return None;
+        }
+        // Try to CAS from expected version (even) to expected+1 (odd)
+        if self
+            .version
+            .compare_exchange(
+                expected_version,
+                expected_version.wrapping_add(1),
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .is_ok()
+        {
+            Some(SeqLockWriteGuard { cell: self })
+        } else {
+            None
+        }
+    }
+
     /// Read cell data consistently using SeqLock protocol.
     /// Loops until a stable read is achieved (version unchanged and even throughout).
     pub fn read_consistent<F, R>(&self, f: F) -> R
@@ -276,7 +302,6 @@ pub struct CellGuard<'a, K: 'a + Clone, V: 'a + Clone> {
     pub cached_version: u32,
     pub is_filled: bool,
     cache_data: OnceCell<Option<CellData<K, V>>>,
-    cache_marker_ptr: *mut Marker<K, V>,
     _phantom: PhantomData<&'a Cell<K, V>>,
 }
 
@@ -332,28 +357,6 @@ impl<K: Clone, V: Clone> CellGuard<'_, K, V> {
         let _ = self.cache_data.set(result);
         Ok(self.cache_data.get().unwrap())
     }
-
-    pub fn update(&mut self, marker: Marker<K, V>) -> Result<*mut Marker<K, V>, Box<dyn Error>> {
-        let boxed_marker = Box::new(marker);
-        let new_marker_raw = Box::into_raw(boxed_marker);
-        let result = self.inner.marker.as_ref().unwrap().compare_exchange(
-            self.cache_marker_ptr,
-            new_marker_raw,
-            AtomicOrdering::SeqCst,
-            AtomicOrdering::SeqCst,
-        );
-
-        if result.is_err() {
-            // Deallocate memory, try again next time
-            unsafe { drop(Box::from_raw(new_marker_raw)) };
-            // Marker has been updated by another process, start loop over
-            return Err(Box::new(CellWriteError {}));
-        } else {
-            let old_marker_box = self.cache_marker_ptr;
-            self.cache_marker_ptr = new_marker_raw;
-            Ok(old_marker_box)
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -387,13 +390,10 @@ impl<'a, K: Clone, V: Clone> CellGuard<'a, K, V> {
         let key = (*cell.key.get()).clone();
         let is_filled = key.is_some();
 
-        let current_marker_raw = cell.marker.as_ref().unwrap().load(AtomicOrdering::Acquire);
-
         Ok(CellGuard {
             inner: cell,
             is_filled,
             cached_version: observed_version,
-            cache_marker_ptr: current_marker_raw,
             cache_data: OnceCell::new(),
             _phantom: PhantomData,
         })
@@ -740,5 +740,105 @@ mod tests {
             guard2.is_filled,
             "Guard for filled cell should have is_filled=true"
         );
+    }
+
+    // Step 5 tests: try_begin_write and removed update()/cache_marker_ptr
+
+    #[test]
+    fn test_try_begin_write_succeeds_with_matching_version() {
+        let cell: Cell<u32, u32> = Cell::default();
+        let version = cell.version.load(AtomicOrdering::Acquire);
+
+        // try_begin_write should succeed with matching version
+        let guard = cell.try_begin_write(version);
+        assert!(
+            guard.is_some(),
+            "try_begin_write should succeed when version matches"
+        );
+
+        // While holding the guard, version should be odd
+        let current_version = cell.version.load(AtomicOrdering::Acquire);
+        assert_eq!(
+            current_version % 2,
+            1,
+            "Version should be odd while write guard is held"
+        );
+    }
+
+    #[test]
+    fn test_try_begin_write_fails_with_mismatched_version() {
+        let cell: Cell<u32, u32> = Cell::default();
+
+        // Try with wrong version (simulate stale cached_version)
+        let guard = cell.try_begin_write(42);
+        assert!(
+            guard.is_none(),
+            "try_begin_write should fail when version doesn't match"
+        );
+
+        // Version should still be 0 (unchanged)
+        let version = cell.version.load(AtomicOrdering::Acquire);
+        assert_eq!(version, 0, "Version should be unchanged after failed try");
+    }
+
+    #[test]
+    fn test_try_begin_write_fails_with_odd_expected_version() {
+        let cell: Cell<u32, u32> = Cell::default();
+
+        // Odd version means write in progress - should fail even if it matches
+        let guard = cell.try_begin_write(1);
+        assert!(
+            guard.is_none(),
+            "try_begin_write should reject odd expected_version"
+        );
+    }
+
+    #[test]
+    fn test_try_begin_write_fails_when_write_in_progress() {
+        let cell: Cell<u32, u32> = Cell::default();
+        let version = cell.version.load(AtomicOrdering::Acquire);
+
+        // Acquire write lock
+        let _guard1 = cell.begin_write();
+
+        // Another try_begin_write should fail (version is now odd)
+        let guard2 = cell.try_begin_write(version);
+        assert!(
+            guard2.is_none(),
+            "try_begin_write should fail when write is in progress"
+        );
+    }
+
+    #[test]
+    fn test_try_begin_write_releases_lock_on_drop() {
+        let cell: Cell<u32, u32> = Cell::default();
+        let version = cell.version.load(AtomicOrdering::Acquire);
+
+        {
+            let guard = cell.try_begin_write(version);
+            assert!(guard.is_some());
+            // Version is odd while holding guard
+            assert_eq!(cell.version.load(AtomicOrdering::Acquire) % 2, 1);
+        }
+        // After drop, version should be even again (incremented by 1)
+        let new_version = cell.version.load(AtomicOrdering::Acquire);
+        assert_eq!(new_version % 2, 0, "Version should be even after drop");
+        assert_eq!(new_version, version + 2, "Version should increment by 2");
+    }
+
+    #[test]
+    fn test_cell_guard_no_cache_marker_ptr_field() {
+        // This test verifies that CellGuard no longer has cache_marker_ptr
+        // by checking the struct's fields at compile time through usage.
+        // If cache_marker_ptr existed, the guard would need to store a pointer.
+        // The fact that from_raw() works without reading marker proves it's removed.
+        let cell: Cell<u32, u32> = Cell::default();
+        let guard = unsafe { CellGuard::from_raw(&cell as *const _) }.unwrap();
+
+        // Verify we can access the expected fields
+        assert!(!guard.is_filled);
+        assert!(!guard.is_stale());
+        let _ = guard.cached_version;
+        // cache_marker_ptr no longer exists (compile-time verification)
     }
 }

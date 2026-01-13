@@ -44,12 +44,12 @@ The following steps remove marker-based logic incrementally. Each step should re
    - ~~Keep marker logic in parallel for now (dual-write) to maintain compatibility~~
    - ~~Update version bump logic to rely on `SeqLockWriteGuard` drop~~
 
-5. **Remove `CellGuard::update()` method**:
+5. ~~**Remove `CellGuard::update()` method**:~~
 
-   - After Step 4, marker CAS is no longer needed for correctness
-   - Remove the `update()` method from `CellGuard`
-   - Remove `cache_marker_ptr` field from `CellGuard`
-   - Update any call sites that used `update()` to use `begin_write()` directly
+   - ~~After Step 4, marker CAS is no longer needed for correctness~~
+   - ~~Remove the `update()` method from `CellGuard`~~
+   - ~~Remove `cache_marker_ptr` field from `CellGuard`~~
+   - ~~Update any call sites that used `update()` to use `begin_write()` directly~~
 
 6. **Remove `marker` field from `CellData`**:
 

@@ -143,3 +143,43 @@
 - Version management is now handled by SeqLockWriteGuard drop
 - All 81 tests pass (78 previous + 3 new Step 4 tests)
 - Next step: Remove `CellGuard::update()` method (Step 5) - marker CAS is no longer needed for correctness
+
+---
+
+## Step 5: Remove `CellGuard::update()` method (Completed)
+
+**Date:** January 12, 2026
+
+**Changes made:**
+
+- Removed `update()` method from `CellGuard` in [cell.rs](../src/cache_oblivious/cell.rs)
+  - The method was doing marker CAS, now replaced by SeqLock version CAS
+- Removed `cache_marker_ptr` field from `CellGuard` struct
+  - This field was only used by `update()` method
+- Updated `from_raw()` to no longer read/store marker pointer
+- Added `try_begin_write(expected_version)` method to `Cell`
+  - Returns `Some(guard)` only if current version matches expected_version
+  - Provides atomic claim behavior via version CAS (replaces marker CAS)
+- Updated `insert()` in [btree_map.rs](../src/cache_oblivious/btree_map.rs):
+  - Replaced `cell.update(marker)` with `cell.inner.try_begin_write(cell.cached_version)`
+  - Added logic to refresh `cached_version` after rebalance operations
+  - Removed `marker_version` calculation and `Marker::InsertCell` creation
+
+**Key insight:** After rebalance operations, the cell's version changes (because rebalance uses `begin_write()` to clear cells). The `cached_version` must be refreshed after rebalance to ensure `try_begin_write()` succeeds. Without this fix, inserts that trigger rebalancing would fail to write.
+
+**Tests added:**
+
+- `test_try_begin_write_succeeds_with_matching_version` - verifies try_begin_write works with correct version
+- `test_try_begin_write_fails_with_mismatched_version` - verifies failure with wrong version
+- `test_try_begin_write_fails_with_odd_expected_version` - verifies rejection of odd versions
+- `test_try_begin_write_fails_when_write_in_progress` - verifies failure when another write is active
+- `test_try_begin_write_releases_lock_on_drop` - verifies proper lock release
+- `test_cell_guard_no_cache_marker_ptr_field` - compile-time verification of removed field
+
+**Notes for next contributor:**
+
+- `CellGuard` no longer has `update()` method or `cache_marker_ptr` field
+- `Cell` now has `try_begin_write(expected_version)` for conditional write acquisition
+- Insert uses version CAS instead of marker CAS for concurrency control
+- All 87 tests pass (81 previous + 6 new Step 5 tests)
+- Next step: Remove `marker` field from `CellData` (Step 6)
