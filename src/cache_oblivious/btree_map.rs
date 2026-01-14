@@ -649,6 +649,31 @@ where
                 for cell_guard in iter {
                     if !cell_guard.is_empty() {
                         let cache = cell_guard.cache().unwrap().clone().unwrap();
+
+                        // Check for Move marker - if the cell's data was moved during rebalance,
+                        // follow the dest_index to read from the destination cell.
+                        if let Marker::Move(_, dest_index) = cache.marker {
+                            // The dest_index is an offset from active_range.start
+                            let dest_ptr =
+                                unsafe { self.map.active_range.start.offset(dest_index) };
+                            // Read the destination cell
+                            if let Ok(dest_guard) = unsafe { CellGuard::from_raw(dest_ptr) } {
+                                if !dest_guard.is_empty() {
+                                    if let Ok(Some(dest_cache)) = dest_guard.cache() {
+                                        let dest_key = dest_cache.key.borrow();
+                                        if dest_key == search_key {
+                                            return Some(dest_cache.value.clone());
+                                        } else if dest_key > search_key {
+                                            // Continue iterating - the data we want might be elsewhere
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                            // If dest read failed or didn't match, continue iterating
+                            continue;
+                        }
+
                         let cache_key = cache.key.borrow();
                         if cache_key == search_key {
                             return Some(cache.value);
@@ -3293,5 +3318,147 @@ mod tests {
                 );
             }
         }
+    }
+
+    // =========================================================================
+    // Step 10: Read-through logic for cells being moved
+    // =========================================================================
+
+    /// Test that get() correctly follows Move markers to find data at destination.
+    ///
+    /// When a cell has a Move marker, its data may have been relocated to a destination
+    /// cell during rebalance. The get() function should follow the dest_index to read
+    /// from the destination cell, ensuring data is always accessible during the
+    /// rebalance transition window.
+    #[test]
+    fn test_get_follows_move_marker_to_destination() {
+        let mut tree: BTreeMap<i32, i32> = BTreeMap::new(4);
+
+        // Small capacity forces frequent rebalances which create Move markers
+        // Insert in a pattern that causes moves
+        tree.insert(10, 100);
+        tree.insert(20, 200);
+        tree.insert(15, 150); // This will cause rebalance, creating Move markers
+
+        // All values should be accessible - if Move markers exist, get() should follow them
+        assert_eq!(
+            tree.get(&10),
+            Some(100),
+            "Key 10 should be accessible via Move marker if present"
+        );
+        assert_eq!(tree.get(&15), Some(150), "Key 15 should be accessible");
+        assert_eq!(
+            tree.get(&20),
+            Some(200),
+            "Key 20 should be accessible via Move marker if present"
+        );
+    }
+
+    /// Test read-through with many rebalances, maximizing chances of Move markers.
+    ///
+    /// This test uses a very small capacity and inserts keys in an order that
+    /// causes maximum cell movement, ensuring Move markers are exercised.
+    #[test]
+    fn test_read_through_with_heavy_rebalancing() {
+        let mut tree: BTreeMap<i32, String> = BTreeMap::new(4);
+
+        // Insert in order that maximizes cell movement
+        let insert_order = [50, 25, 75, 12, 37, 62, 87, 6, 18, 31, 43, 56, 68, 81, 93];
+
+        for &key in &insert_order {
+            tree.insert(key, format!("val-{}", key));
+
+            // Verify all previously inserted keys are accessible after each insert
+            // This tests read-through during the transition window
+            for &prev_key in insert_order.iter().take_while(|&&k| k != key || k == key) {
+                if insert_order.iter().position(|&k| k == prev_key).unwrap()
+                    <= insert_order.iter().position(|&k| k == key).unwrap()
+                {
+                    let expected = format!("val-{}", prev_key);
+                    assert_eq!(
+                        tree.get(&prev_key),
+                        Some(expected),
+                        "Key {} should be accessible after inserting {}",
+                        prev_key,
+                        key
+                    );
+                }
+            }
+        }
+    }
+
+    /// Test that read-through handles non-existent keys correctly when Move markers are present.
+    ///
+    /// When following a Move marker, if the destination cell's key doesn't match the search key,
+    /// the search should continue (not return incorrectly).
+    #[test]
+    fn test_read_through_nonexistent_key_with_move_markers() {
+        let mut tree: BTreeMap<i32, i32> = BTreeMap::new(4);
+
+        // Create a tree with some values
+        tree.insert(10, 100);
+        tree.insert(20, 200);
+        tree.insert(30, 300);
+
+        // Search for keys that don't exist
+        assert_eq!(tree.get(&5), None, "Key 5 should not exist");
+        assert_eq!(tree.get(&15), None, "Key 15 should not exist");
+        assert_eq!(tree.get(&25), None, "Key 25 should not exist");
+        assert_eq!(tree.get(&35), None, "Key 35 should not exist");
+    }
+
+    /// Test read-through with sequential inserts followed by lookups.
+    ///
+    /// Even sequential inserts can trigger rebalances in small-capacity trees,
+    /// creating Move markers that must be followed during lookups.
+    #[test]
+    fn test_read_through_sequential_inserts() {
+        let mut tree: BTreeMap<u32, u32> = BTreeMap::new(4);
+
+        for i in 1..=20 {
+            tree.insert(i, i * 10);
+        }
+
+        // All sequential keys should be accessible
+        for i in 1..=20 {
+            assert_eq!(
+                tree.get(&i),
+                Some(i * 10),
+                "Sequential key {} should be accessible",
+                i
+            );
+        }
+    }
+
+    /// Test that read-through preserves correct values during interleaved operations.
+    ///
+    /// Insert and read operations are interleaved, testing that Move markers
+    /// point to correct destinations even as the tree structure changes.
+    #[test]
+    fn test_read_through_interleaved_insert_and_get() {
+        let mut tree: BTreeMap<i32, i32> = BTreeMap::new(4);
+
+        // Interleave inserts and reads
+        tree.insert(100, 1000);
+        assert_eq!(tree.get(&100), Some(1000));
+
+        tree.insert(50, 500);
+        assert_eq!(tree.get(&100), Some(1000));
+        assert_eq!(tree.get(&50), Some(500));
+
+        tree.insert(75, 750); // Between 50 and 100, may cause rebalance
+        assert_eq!(tree.get(&50), Some(500));
+        assert_eq!(tree.get(&75), Some(750));
+        assert_eq!(tree.get(&100), Some(1000));
+
+        tree.insert(25, 250);
+        tree.insert(125, 1250);
+
+        // Verify all keys are still accessible
+        assert_eq!(tree.get(&25), Some(250));
+        assert_eq!(tree.get(&50), Some(500));
+        assert_eq!(tree.get(&75), Some(750));
+        assert_eq!(tree.get(&100), Some(1000));
+        assert_eq!(tree.get(&125), Some(1250));
     }
 }

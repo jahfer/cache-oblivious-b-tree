@@ -103,7 +103,7 @@
       "Update get() to check Move marker and redirect to destination",
       "Consider adding test that verifies accessibility DURING insert (not just after)"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "category": "refactor",

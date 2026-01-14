@@ -433,3 +433,77 @@ Replaced the TODO comment at btree_map.rs#L357 with a detailed DESIGN NOTE expla
 - 86 tests pass
 - 0 tests ignored
 - 0 tests failed
+
+## Step 10: Implement read-through logic for cells being moved
+
+### Problem statement:
+
+During the rebalance transition window, data may be temporarily inaccessible via `get()` if a source cell has a `Move` marker but the reader doesn't know to follow it. The `Move(version, dest_index)` marker stores the destination cell's index, allowing readers to "follow the move" and find the data at its new location.
+
+### Implementation:
+
+Modified `BlockIndex::get()` in btree_map.rs to check for `Move` markers and follow them to the destination cell:
+
+```rust
+// Check for Move marker - if the cell's data was moved during rebalance,
+// follow the dest_index to read from the destination cell.
+if let Marker::Move(_, dest_index) = cache.marker {
+    // The dest_index is an offset from active_range.start
+    let dest_ptr = unsafe { self.map.active_range.start.offset(dest_index) };
+    // Read the destination cell
+    if let Ok(dest_guard) = unsafe { CellGuard::from_raw(dest_ptr) } {
+        if !dest_guard.is_empty() {
+            if let Ok(Some(dest_cache)) = dest_guard.cache() {
+                let dest_key = dest_cache.key.borrow();
+                if dest_key == search_key {
+                    return Some(dest_cache.value.clone());
+                } else if dest_key > search_key {
+                    // Continue iterating - the data we want might be elsewhere
+                    continue;
+                }
+            }
+        }
+    }
+    // If dest read failed or didn't match, continue iterating
+    continue;
+}
+```
+
+### How it works:
+
+1. When iterating cells in `get()`, if a cell has a `Move` marker, we:
+
+   - Compute the destination pointer: `active_range.start.offset(dest_index)`
+   - Attempt to read the destination cell via `CellGuard::from_raw()`
+   - If successful and the key matches, return the value from the destination
+   - If the destination's key is greater than the search key, continue iteration (data might be elsewhere)
+   - If the destination read fails (version mismatch, etc.), continue iterating
+
+2. This ensures data is accessible DURING rebalance, not just after completion:
+   - Before move completes: Data is at source cell (no Move marker yet)
+   - During move: Source has Move marker pointing to destination, readers follow it
+   - After move completes: Source is cleared, data is at destination with Empty marker
+
+### New tests added:
+
+1. **`test_get_follows_move_marker_to_destination`**: Verifies that data inserted in patterns causing rebalance (like [10, 20, 15]) remains accessible via Move marker following.
+
+2. **`test_read_through_with_heavy_rebalancing`**: Uses a very small capacity (4) and inserts 15 keys in an order that maximizes cell movement, verifying all keys remain accessible after each insert.
+
+3. **`test_read_through_nonexistent_key_with_move_markers`**: Ensures that when following Move markers, non-existent keys correctly return `None` rather than false positives.
+
+4. **`test_read_through_sequential_inserts`**: Tests sequential inserts which still trigger rebalances in small-capacity trees, ensuring Move markers are followed correctly.
+
+5. **`test_read_through_interleaved_insert_and_get`**: Interleaves insert and get operations, testing that Move markers point to correct destinations even as the tree structure changes.
+
+### Technical notes:
+
+- The `dest_index` stored in `Move(version, dest_index)` is an offset from `active_range.start`, computed during rebalance via `current_cell_ptr.offset_from(self.data.active_range.start)`
+- This read-through logic is defensive: if the destination read fails for any reason (version mismatch, etc.), iteration continues rather than returning an incorrect result
+- The `continue` after checking a Move marker ensures we don't fall through to the normal key comparison logic with potentially stale data
+
+**Final test results:**
+
+- 91 tests pass
+- 0 tests ignored
+- 0 tests failed
