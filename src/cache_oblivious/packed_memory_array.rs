@@ -99,15 +99,6 @@ impl<T> PackedMemoryArray<T> {
     pub fn is_valid_pointer(&self, ptr: &*const T) -> bool {
         self.active_range.contains(ptr)
     }
-    /// Computes the active range of a slice, excluding buffer regions on both ends.
-    /// The buffer space is 1/4 of the total length on each side.
-    fn compute_active_range(cells: &[T]) -> Range<*const T> {
-        let buffer_space = cells.len() >> 2;
-        Range {
-            start: &cells[buffer_space] as *const _,
-            end: &cells[cells.len() - buffer_space] as *const _,
-        }
-    }
 
     fn compute_density_range(cell_count: f32) -> Vec<Density> {
         let num_densities = f32::log2(cell_count) as isize;
