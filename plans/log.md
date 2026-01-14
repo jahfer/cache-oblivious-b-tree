@@ -560,3 +560,33 @@ if let Marker::Move(_, dest_index) = cache.marker {
 - 96 tests pass
 - 0 tests ignored
 - 0 tests failed
+
+## Step 12: Removed crossbeam-epoch refactoring steps
+
+After analysis, the crossbeam-epoch migration was deemed unnecessary:
+
+### Rationale for removal
+
+The current marker memory management is safe because:
+
+1. **Marker memory is reused, not freed** - The pattern `prev_marker.unwrap().write(Marker::Empty(new_version))` overwrites markers in place
+2. **No use-after-free risk** - Since markers are never deallocated during normal operation, there's no dangling pointer hazard
+3. **Pin semantics on PMA cells** - Cell data stays pinned in the packed-memory array
+
+While epoch-based reclamation would enable a cleaner "allocate fresh, defer-destroy old" pattern, the current design is:
+
+- Functionally safe
+- Lower overhead (no epoch tracking)
+- Already working correctly
+
+### Steps removed from plan
+
+The following refactoring steps were removed as unnecessary:
+
+- Replace `AtomicPtr` with `crossbeam_epoch::Atomic`
+- Eliminate marker memory reuse pattern
+- Thread Guard through read/write operations
+- Split CellGuard into CellReadGuard / CellWriteGuard
+- Encapsulate Cell fields as private
+
+The `crossbeam-epoch` dependency can remain in Cargo.toml for potential future use, but is not actively used.

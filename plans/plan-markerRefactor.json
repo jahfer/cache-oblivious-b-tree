@@ -115,59 +115,6 @@
     "passes": true
   },
   {
-    "category": "refactor",
-    "description": "Replace AtomicPtr with crossbeam_epoch::Atomic",
-    "steps": [
-      "Change marker: Option<AtomicPtr<Marker<K, V>>> in cell.rs",
-      "Update to marker: Atomic<Marker<K, V>>",
-      "Remove Option wrapper entirely"
-    ],
-    "passes": false
-  },
-  {
-    "category": "refactor",
-    "description": "Eliminate marker memory reuse pattern",
-    "steps": [
-      "Remove unsafe reuse at cell.rs#L151",
-      "Remove unsafe reuse at packed_memory_array.rs#L319",
-      "Allocate fresh Owned<Marker> instead",
-      "Defer-destroy old markers via Guard::defer_destroy()"
-    ],
-    "passes": false
-  },
-  {
-    "category": "refactor",
-    "description": "Thread Guard through read/write operations",
-    "steps": [
-      "Update cache() to accept or pin a crossbeam_epoch::Guard",
-      "Update update() to accept or pin a crossbeam_epoch::Guard",
-      "Update PMA iteration to use Guard",
-      "Ensure markers aren't reclaimed while readers hold references"
-    ],
-    "passes": false
-  },
-  {
-    "category": "refactor",
-    "description": "Split CellGuard into CellReadGuard / CellWriteGuard",
-    "steps": [
-      "Create CellWriteGuard that auto-commits version bump on Drop",
-      "CellWriteGuard defers marker destruction on Drop",
-      "Create CellReadGuard that holds epoch Guard",
-      "CellReadGuard keeps marker alive during access"
-    ],
-    "passes": false
-  },
-  {
-    "category": "refactor",
-    "description": "Encapsulate Cell fields as private",
-    "steps": [
-      "Hide version, marker, key, value fields",
-      "Implement try_claim() -> Option<CellWriteGuard>",
-      "Implement read(guard) -> Option<CellReadGuard>"
-    ],
-    "passes": false
-  },
-  {
     "category": "documentation",
     "description": "Add #[must_use], typed errors, and documentation",
     "steps": [
