@@ -124,7 +124,7 @@
       "Include state-transition diagram in docs",
       "Add // SAFETY: comments for remaining unsafe blocks"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "category": "performance",

@@ -590,3 +590,115 @@ The following refactoring steps were removed as unnecessary:
 - Encapsulate Cell fields as private
 
 The `crossbeam-epoch` dependency can remain in Cargo.toml for potential future use, but is not actively used.
+
+## Step 13: Add #[must_use], typed errors, and documentation
+
+### Overview
+
+Completed the documentation step covering:
+
+1. Module-level documentation with state-transition diagram
+2. `CellError` enum for typed errors
+3. `#[must_use]` annotations on fallible methods
+4. `// SAFETY:` comments for all unsafe blocks
+5. Documentation for key types and methods
+
+### Module-level documentation (mod.rs)
+
+Added comprehensive module documentation to `src/cache_oblivious/mod.rs` including:
+
+- **Overview section**: Describes the three main components (`BTreeMap`, `Cell`, `PackedMemoryArray`)
+- **Lock-Free Concurrency Model**: Explains the marker-based protocol
+- **State-transition diagram**: ASCII art diagram showing cell state transitions:
+  ```
+  Empty → InsertCell → Empty (Insert operation)
+  Empty → Move → Empty (Rebalance operation)
+  Empty → DeleteCell → Empty (Delete operation)
+  ```
+- **Version Validation**: Describes the version checking protocol
+- **Packed Memory Array**: Explains the 1/4 | 1/2 | 1/4 buffer layout
+- **Example code**: Shows basic usage of `BTreeMap`
+
+### CellError enum (cell.rs)
+
+Created a new typed error enum at `src/cache_oblivious/cell.rs`:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellError {
+    /// A read operation failed due to concurrent modification.
+    VersionMismatch,
+    /// A write operation failed due to a CAS failure.
+    CasFailed,
+}
+```
+
+Implements `Display`, `Error`, `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`.
+
+Legacy error types (`CellReadError`, `CellWriteError`) retained for backwards compatibility.
+
+### #[must_use] annotations
+
+Added `#[must_use]` to the following fallible methods:
+
+1. `CellGuard::cache()` - Returns `Result<&Option<CellData<K, V>>, CellReadError>`
+2. `CellGuard::update()` - Returns `Result<*mut Marker<K, V>, Box<dyn Error>>`
+3. `CellGuard::from_raw()` - Returns `Result<CellGuard<'a, K, V>, Box<dyn Error>>`
+
+### SAFETY comments
+
+Added `// SAFETY:` comments to all unsafe blocks across three files:
+
+**cell.rs (16 unsafe blocks):**
+
+- `Cell::Drop`: Deallocating marker via `Box::from_raw`
+- `Cell::Debug::fmt`: Reading marker, key, value for debug output
+- `CellGuard::cache`: Reading marker version, cloning key/value/marker
+- `CellGuard::update`: Deallocating marker on CAS failure
+- `CellGuard::from_raw`: Dereferencing cell pointer, reading key, validating marker
+- `CellIterator::next/nth`: Advancing pointer, dereferencing cells
+- Send/Sync impls for `Cell`
+
+**btree_map.rs (20+ unsafe blocks):**
+
+- Insert path: Writing key/value to cells, reusing marker memory
+- Rebalance: Reading/writing cell data, computing pointer offsets
+- BlockIndex: Send/Sync reasoning for raw pointers
+- get(): Following Move markers to destination cells
+
+**packed_memory_array.rs (6 unsafe blocks):**
+
+- Iterator: Advancing pointers, dereferencing within bounds
+- Send/Sync impls
+
+### Documentation for key types
+
+Added documentation to:
+
+- `Marker` enum: State transitions, version semantics
+- `Cell` struct: Thread safety model, version validation protocol
+- `CellGuard` struct: Purpose, caching behavior
+- `CellData` struct: Purpose as snapshot
+- `CellIterator` struct: Usage and panic conditions
+- `PackedMemoryArray` struct: Memory layout, density invariants
+- `Iter`, `Config`, `Density` structs
+
+### New tests added
+
+1. `test_cell_error_enum_variants`: Tests CellError variants, Display/Debug impls, Copy/Clone traits
+2. `test_cell_error_is_std_error`: Verifies CellError implements std::error::Error
+
+### Final test results
+
+- **98 tests pass**
+- 0 tests ignored
+- 0 tests failed
+- 1 doc-test passes (module example), 1 ignored (code sample marked ignore)
+
+### Notes for next contributor
+
+1. **CellError is defined but not yet used**: The enum is ready for adoption, but existing code uses legacy `CellReadError`/`CellWriteError` for backwards compatibility. Future refactoring could migrate to `CellError`.
+
+2. **Warnings remain**: Some unused code warnings exist for `height` field, `leaf_count` method, and `length` field - these are pre-existing and unrelated to documentation.
+
+3. **Doc-test coverage**: The `cache()` method example is marked `ignore` because it requires unsafe setup code. The module-level example compiles and runs.

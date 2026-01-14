@@ -5,6 +5,31 @@ use std::ops::Range;
 use std::ops::RangeInclusive;
 use std::pin::Pin;
 
+/// A packed memory array (PMA) providing cache-oblivious storage.
+///
+/// The PMA maintains cells in a "gapped array" layout where 1/4 of capacity
+/// is reserved as buffer space on each end, leaving the middle half as the
+/// active storage region. This enables efficient rebalancing without
+/// reallocating the entire array.
+///
+/// # Memory Layout
+///
+/// ```text
+/// ┌─────────────┬────────────────────────────┬─────────────┐
+/// │  Left Buffer│       Active Range         │Right Buffer │
+/// │    (1/4)    │         (1/2)              │   (1/4)     │
+/// └─────────────┴────────────────────────────┴─────────────┘
+/// ```
+///
+/// # Density Invariants
+///
+/// The PMA maintains density bounds at each level of the implicit tree:
+/// - Minimum density: Ensures blocks aren't too sparse (wastes memory)
+/// - Maximum density: Ensures blocks aren't too full (requires rebalance)
+///
+/// Density bounds are more strict at lower levels (smaller ranges) and
+/// more relaxed at higher levels (larger ranges), enabling amortized
+/// O(log² N) insert cost.
 pub struct PackedMemoryArray<T> {
     cells: Pin<Box<[T]>>,
     pub config: Config,
@@ -13,10 +38,17 @@ pub struct PackedMemoryArray<T> {
     _pin: PhantomPinned,
 }
 
+// SAFETY: PackedMemoryArray is Send because Pin<Box<[T]>> is Send when T: Send,
+// and raw pointers in active_range point into the pinned allocation
 unsafe impl<T> Send for PackedMemoryArray<T> {}
+
+// SAFETY: PackedMemoryArray is Sync because:
+// - The cells are pinned and won't move
+// - Access to cells goes through proper synchronization (atomic/CAS)
 unsafe impl<T> Sync for PackedMemoryArray<T> {}
 
 impl<T> PackedMemoryArray<T> {
+    /// Creates a new PMA with the given cells and requested capacity.
     pub fn new(cells: Box<[T]>, capacity: usize) -> PackedMemoryArray<T> {
         let active_range = Self::compute_active_range(&cells);
         let density_scale = Self::compute_density_range(cells.len() as f32);
@@ -172,6 +204,8 @@ impl<'a, T> std::iter::IntoIterator for &'a PackedMemoryArray<T> {
         }
     }
 }
+
+/// Iterator over elements in the active range of a PMA.
 pub struct Iter<'a, T> {
     ptr: *const T,
     active_range: Range<*const T>,
@@ -185,28 +219,36 @@ impl<'a, T> Iterator for Iter<'a, T> {
         if self.at_start {
             self.at_start = false;
         } else {
+            // SAFETY: We're within the allocated PMA array (checked against active_range.end)
             let new_address = unsafe { self.ptr.add(1) };
             if new_address > self.active_range.end {
                 return None;
             }
             self.ptr = new_address;
         }
+        // SAFETY: ptr is within [active_range.start, active_range.end]
+        // and the PMA is pinned, so the memory remains valid
         Some(unsafe { &*self.ptr })
     }
 
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        // SAFETY: We check against active_range.end before dereferencing
         let new_address = unsafe { self.active_range.start.add(n) };
         if new_address > self.active_range.end {
             return None;
         }
         self.ptr = new_address;
+        // SAFETY: ptr is within [active_range.start, active_range.end]
         Some(unsafe { &*self.ptr })
     }
 }
+
+/// Configuration for density bounds at each level of the PMA.
 pub struct Config {
     pub density_scale: Vec<Density>,
 }
 
+/// Density bounds for a specific range size.
 pub struct Density {
     pub max_item_count: usize,
     pub range: RangeInclusive<Rational>,

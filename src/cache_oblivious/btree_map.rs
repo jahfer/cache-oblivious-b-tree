@@ -125,6 +125,9 @@ where
                     }
 
                     let prev_marker = result.unwrap();
+                    // SAFETY: We successfully set InsertCell marker, claiming exclusive
+                    // write access to this cell's value. The CAS on marker succeeded,
+                    // so no other thread can be writing to this cell simultaneously.
                     unsafe {
                         cell_guard.inner.value.get().write(Some(value));
                     };
@@ -132,6 +135,9 @@ where
                     inserted_cell_ptr = Some(cell_guard.inner as *const Cell<K, V>);
 
                     let next_version = marker_version + 1;
+                    // SAFETY: prev_marker was returned from update(), meaning we own
+                    // exclusive access to this memory. We reuse it by writing a new
+                    // marker value before swapping it back into the atomic pointer.
                     unsafe { prev_marker.write(Marker::Empty(next_version)) };
                     cell_guard
                         .inner
@@ -159,6 +165,9 @@ where
                         }
 
                         let prev_marker = result.unwrap();
+                        // SAFETY: We successfully set InsertCell marker via CAS,
+                        // claiming exclusive write access to this cell's key/value.
+                        // No other thread can write to this cell while we hold the marker.
                         unsafe {
                             empty_cell.inner.key.get().write(Some(key));
                             empty_cell.inner.value.get().write(Some(value));
@@ -167,6 +176,8 @@ where
                         inserted_cell_ptr = Some(empty_cell.inner as *const Cell<K, V>);
 
                         let next_version = marker_version + 1;
+                        // SAFETY: prev_marker ownership transferred from update(),
+                        // we can safely rewrite its contents before reusing.
                         unsafe { prev_marker.write(Marker::Empty(next_version)) };
                         empty_cell
                             .inner
@@ -209,6 +220,9 @@ where
                 }
 
                 let prev_marker = result.unwrap();
+                // SAFETY: We successfully set InsertCell marker via CAS,
+                // claiming exclusive write access to this cell's key/value.
+                // No other thread can write to this cell while we hold the marker.
                 unsafe {
                     empty_cell.inner.key.get().write(Some(key));
                     empty_cell.inner.value.get().write(Some(value));
@@ -217,6 +231,8 @@ where
                 inserted_cell_ptr = Some(empty_cell.inner as *const Cell<K, V>);
 
                 let next_version = marker_version + 1;
+                // SAFETY: prev_marker ownership transferred from update(),
+                // we can safely rewrite its contents before reusing.
                 unsafe { prev_marker.write(Marker::Empty(next_version)) };
                 empty_cell
                     .inner
@@ -383,7 +399,10 @@ where
             // a sequence number to filter duplicates at the read layer.
 
             for cell_ptr in cells_to_move.iter() {
+                // SAFETY: current_cell_ptr is within active_range bounds,
+                // verified by is_valid_pointer() checks throughout rebalance
                 let cell = unsafe { &*current_cell_ptr };
+                // SAFETY: cell is valid, so its key UnsafeCell is valid
                 let cell_key = unsafe { &*cell.key.get() };
                 if cell_key.is_some() {
                     // The destination cell already has data. This is safe to overwrite because:
@@ -396,6 +415,8 @@ where
                     // We can safely overwrite in both cases. However, if another operation is in
                     // progress (InsertCell/DeleteCell marker), we should retry to avoid conflicts.
                     let dest_marker_raw = cell.marker.as_ref().unwrap().load(Ordering::SeqCst);
+                    // SAFETY: dest_marker_raw loaded from valid AtomicPtr,
+                    // always points to a valid Marker allocated via Box::into_raw
                     let dest_marker = unsafe { &*dest_marker_raw };
                     match dest_marker {
                         Marker::Move(_, _) | Marker::Empty(_) => {
@@ -411,6 +432,8 @@ where
                     }
                 }
 
+                // SAFETY: cell_ptr was collected from iteration over valid cells,
+                // and the PMA cells are pinned in memory (won't move while we hold Arc)
                 let cell_to_move = unsafe { &**cell_ptr };
 
                 // Check if source and destination are the same cell.
@@ -418,6 +441,8 @@ where
                 // In this case, we don't need to move data, but we still decrement the destination
                 // pointer to place the next cell one position to the left.
                 if *cell_ptr == current_cell_ptr {
+                    // SAFETY: current_cell_ptr > cell_ptr_start checked below,
+                    // and we're moving within the valid PMA region
                     current_cell_ptr = unsafe { current_cell_ptr.sub(1) };
                     // Don't go before the start of the rebalance region
                     if current_cell_ptr < cell_ptr_start {
@@ -433,6 +458,8 @@ where
                 let version = cell_to_move.version.load(Ordering::SeqCst);
                 let current_marker_raw =
                     cell_to_move.marker.as_ref().unwrap().load(Ordering::SeqCst);
+                // SAFETY: marker pointer loaded from AtomicPtr is always valid
+                // (created via Box::into_raw in Cell::new/default)
                 let marker = unsafe { &*current_marker_raw };
                 let marker_version = *marker.version();
 
@@ -445,6 +472,8 @@ where
                 // Compute destination index relative to the start of the active range.
                 // This index is stored in the Move marker so readers can follow the move
                 // if they encounter a cell that has been relocated during rebalance.
+                // SAFETY: Both pointers are within the same allocated PMA array,
+                // so offset_from is well-defined
                 let dest_index =
                     unsafe { current_cell_ptr.offset_from(self.data.active_range.start) };
                 let new_marker = Box::new(Marker::Move(marker_version, dest_index));
@@ -460,10 +489,17 @@ where
                 if prev_marker.is_err() {
                     // CAS failure: marker was updated by another thread.
                     // Deallocate our marker and restart the entire rebalance operation.
+                    // SAFETY: new_marker_raw was just created via Box::into_raw above,
+                    // and CAS failed so we still own it exclusively
                     unsafe { drop(Box::from_raw(new_marker_raw)) };
                     continue 'retry;
                 }
 
+                // SAFETY: We successfully set Move marker on cell_to_move via CAS,
+                // claiming write intent. No other thread will attempt to modify
+                // cell_to_move's key/value while Move marker is present.
+                // The destination cell is either empty or has Move/Empty marker
+                // (verified above), so we can write to it.
                 unsafe {
                     // update new cell
                     cell.key.get().write((*cell_to_move.key.get()).clone());
@@ -505,6 +541,8 @@ where
                     );
                 };
 
+                // SAFETY: current_cell_ptr > cell_ptr_start verified by the check below,
+                // so we're still within valid PMA memory
                 current_cell_ptr = unsafe { current_cell_ptr.sub(1) };
                 // Ensure we don't decrement past the start of the rebalance region.
                 // Cells before cell_ptr_start were not collected and must not be overwritten.
@@ -537,6 +575,8 @@ where
         let slice_len = self.data.as_slice().len();
 
         // Check bounds
+        // SAFETY: Both pointers are within the same allocated PMA array,
+        // as verified by the bounds check below
         let offset = unsafe { cell_ptr.offset_from(base_ptr) };
         if offset < 0 || offset as usize >= slice_len {
             return None;
@@ -606,7 +646,16 @@ pub struct BlockIndex<K: Clone + Ord, V: Clone> {
     index_tree: BlockSearchTree<K, V>,
 }
 
+// SAFETY: BlockIndex is Send because:
+// - Arc<PackedMemoryArray<...>> is Send (PMA is Send+Sync)
+// - BlockSearchTree contains raw pointers but they point into the Arc'd PMA,
+//   which is shared via Arc and won't move or deallocate while BlockIndex exists
 unsafe impl<K: Clone + Ord, V: Clone> Send for BlockIndex<K, V> {}
+
+// SAFETY: BlockIndex is Sync because:
+// - All read operations go through proper atomic/version validation
+// - Write operations use CAS to prevent data races
+// - The Arc ensures the underlying PMA is not deallocated
 unsafe impl<K: Clone + Ord, V: Clone> Sync for BlockIndex<K, V> {}
 
 impl<K, V> Debug for BlockIndex<K, V>
@@ -654,9 +703,13 @@ where
                         // follow the dest_index to read from the destination cell.
                         if let Marker::Move(_, dest_index) = cache.marker {
                             // The dest_index is an offset from active_range.start
+                            // SAFETY: dest_index was computed during rebalance via
+                            // offset_from(active_range.start), so adding it back
+                            // produces a valid pointer within the PMA
                             let dest_ptr =
                                 unsafe { self.map.active_range.start.offset(dest_index) };
                             // Read the destination cell
+                            // SAFETY: dest_ptr is within active_range as computed above
                             if let Ok(dest_guard) = unsafe { CellGuard::from_raw(dest_ptr) } {
                                 if !dest_guard.is_empty() {
                                     if let Ok(Some(dest_cache)) = dest_guard.cache() {
