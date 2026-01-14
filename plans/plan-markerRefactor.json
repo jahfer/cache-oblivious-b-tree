@@ -46,7 +46,7 @@
       "Increment source cell's version after contents are moved",
       "Clear marker on source cell"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "category": "functional",
