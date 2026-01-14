@@ -327,7 +327,6 @@ where
         'retry: loop {
             let mut count = 1;
             let mut cells_to_move: VecDeque<*const Cell<K, V>> = VecDeque::new();
-            let mut current_cell_ptr = cell_ptr_start;
 
             // Track the range of cells affected for computing block indices
             let mut last_cell_ptr = cell_ptr_start;
@@ -335,7 +334,6 @@ where
             let iter = CellIterator::new(cell_ptr_start, self.data.active_range.end);
 
             for cell_guard in iter {
-                current_cell_ptr = cell_guard.inner;
                 last_cell_ptr = cell_guard.inner;
 
                 if !cell_guard.is_empty() {
@@ -361,14 +359,22 @@ where
             // There are different strategies available for rebalancing
             // depending on the inserts expected in the system.
             //
-            // To support many inserts in the same area, we want to shift
-            // elements as far right as possible, while still maintaining
-            // our density thresholds. Since we know we needed exactly
-            // this # of cells to meet our density, one less than this
-            // should let each region maximize their respective thresholds.
+            // We spread elements evenly across the range to ensure gaps are
+            // distributed throughout, not concentrated at one end. This allows
+            // subsequent inserts to find gaps near their insertion point.
 
-            // Starting at current_marker_raw, move the cells rightward
-            // until their max density is reached
+            // DESIGN NOTE: Even spreading of elements
+            //
+            // The range has `count` positions and `cells_to_move.len()` cells.
+            // We spread cells evenly by calculating positions:
+            //   position[i] = cell_ptr_start + (i + 1) * count / (num_cells + 1)
+            // This places cells with gaps between them.
+            //
+            // Example: 3 cells in range of 8 positions
+            //   position[0] = 0 + 1 * 8 / 4 = 2
+            //   position[1] = 0 + 2 * 8 / 4 = 4
+            //   position[2] = 0 + 3 * 8 / 4 = 6
+            // Result: [_, _, C0, _, C1, _, C2, _] - gaps at 0,1,3,5,7
 
             // DESIGN NOTE: Atomic guarantees for cell moves
             //
@@ -398,10 +404,27 @@ where
             // requiring stronger atomicity (no duplicate visibility), consider adding
             // a sequence number to filter duplicates at the read layer.
 
-            for cell_ptr in cells_to_move.iter() {
-                // SAFETY: current_cell_ptr is within active_range bounds,
-                // verified by is_valid_pointer() checks throughout rebalance
-                let cell = unsafe { &*current_cell_ptr };
+            // Calculate evenly-spaced destination positions for each cell.
+            // We process cells in reverse order (rightmost first) to avoid overwriting
+            // cells that haven't been moved yet.
+            let num_cells = cells_to_move.len();
+            let range_size = count; // Total positions in the rebalance range
+
+            // cells_to_move is in reverse order (rightmost cell first due to push_front)
+            // So cells_to_move[0] is the rightmost cell, cells_to_move[num_cells-1] is leftmost
+            // We want rightmost cell at highest position, leftmost at lowest position
+            for (i, cell_ptr) in cells_to_move.iter().enumerate() {
+                // Calculate destination position for this cell.
+                // Cell index in sorted order: num_cells - 1 - i (since cells_to_move is reversed)
+                // Position formula: cell_ptr_start + (sorted_idx + 1) * range_size / (num_cells + 1)
+                let sorted_idx = num_cells - 1 - i;
+                let dest_offset = (sorted_idx + 1) * range_size / (num_cells + 1);
+                // SAFETY: dest_offset is within [0, range_size), and cell_ptr_start + range_size
+                // is within the valid PMA region (verified by density scan above)
+                let dest_ptr = unsafe { cell_ptr_start.add(dest_offset) };
+
+                // SAFETY: dest_ptr is within active_range bounds
+                let cell = unsafe { &*dest_ptr };
                 // SAFETY: cell is valid, so its key UnsafeCell is valid
                 let cell_key = unsafe { &*cell.key.get() };
                 if cell_key.is_some() {
@@ -438,21 +461,10 @@ where
 
                 // Check if source and destination are the same cell.
                 // This happens when a cell is already in its correct position after spreading.
-                // In this case, we don't need to move data, but we still decrement the destination
-                // pointer to place the next cell one position to the left.
-                if *cell_ptr == current_cell_ptr {
-                    // SAFETY: current_cell_ptr > cell_ptr_start checked below,
-                    // and we're moving within the valid PMA region
-                    current_cell_ptr = unsafe { current_cell_ptr.sub(1) };
-                    // Don't go before the start of the rebalance region
-                    if current_cell_ptr < cell_ptr_start {
-                        break;
-                    }
-                    if self.data.is_valid_pointer(&current_cell_ptr) {
-                        continue;
-                    } else {
-                        break;
-                    }
+                // In this case, we don't need to move data.
+                if *cell_ptr == dest_ptr {
+                    // Cell is already at its target position, no move needed
+                    continue;
                 }
 
                 let version = cell_to_move.version.load(Ordering::SeqCst);
@@ -474,8 +486,7 @@ where
                 // if they encounter a cell that has been relocated during rebalance.
                 // SAFETY: Both pointers are within the same allocated PMA array,
                 // so offset_from is well-defined
-                let dest_index =
-                    unsafe { current_cell_ptr.offset_from(self.data.active_range.start) };
+                let dest_index = unsafe { dest_ptr.offset_from(self.data.active_range.start) };
                 let new_marker = Box::new(Marker::Move(marker_version, dest_index));
 
                 let new_marker_raw = Box::into_raw(new_marker);
@@ -540,27 +551,11 @@ where
                         Ordering::SeqCst,
                     );
                 };
-
-                // SAFETY: current_cell_ptr > cell_ptr_start verified by the check below,
-                // so we're still within valid PMA memory
-                current_cell_ptr = unsafe { current_cell_ptr.sub(1) };
-                // Ensure we don't decrement past the start of the rebalance region.
-                // Cells before cell_ptr_start were not collected and must not be overwritten.
-                if current_cell_ptr < cell_ptr_start {
-                    break;
-                }
-                if self.data.is_valid_pointer(&current_cell_ptr) {
-                    continue;
-                } else {
-                    unreachable!("We've reached the end of the initialized cell buffer!");
-                }
             }
 
             // Compute the affected block range
-            // Cells move from first_cell_ptr toward current_cell_ptr (which moved backward)
-            // The affected range spans from the destination (current_cell_ptr moved back)
-            // to the source area (first_cell_ptr through last_cell_ptr)
-            return self.compute_affected_blocks(current_cell_ptr, last_cell_ptr);
+            // With even spreading, affected range spans from cell_ptr_start to last_cell_ptr
+            return self.compute_affected_blocks(cell_ptr_start, last_cell_ptr);
         }
     }
 
@@ -2546,14 +2541,12 @@ mod tests {
         // This is still significantly better than the 10x expected for O(N)
         let ratio = large_elapsed.as_nanos() as f64 / small_elapsed.as_nanos().max(1) as f64;
 
-        // Allow up to 20x ratio to account for measurement noise, cache effects, debug mode,
-        // and the correctness fix that requires more rebalances to maintain sorted order.
-        // The fix for non-sequential inserts (Step 7) prioritizes correctness over performance.
-        // Future optimization: implement local compaction to avoid full rebalances when a gap
-        // exists but is in the "wrong" position relative to the insertion point.
+        // Allow up to 3x ratio to account for measurement noise, cache effects, and debug mode.
+        // By spreading elements evenly during rebalance (per the cache-oblivious B-tree paper),
+        // gaps are distributed throughout the range, reducing rebalances for interleaved inserts.
         assert!(
-            ratio < 20.0,
-            "Insert time scaled too much with size: {:.2}x (expected <20x for sublinear behavior). \
+            ratio < 3.0,
+            "Insert time scaled too much with size: {:.2}x (expected <5x for sublinear behavior). \
              Small tree ({} elements): {:?}, Large tree ({} elements): {:?}",
             ratio,
             small_size,
@@ -3513,5 +3506,27 @@ mod tests {
         assert_eq!(tree.get(&75), Some(750));
         assert_eq!(tree.get(&100), Some(1000));
         assert_eq!(tree.get(&125), Some(1250));
+    }
+
+    /// Test interleaved even/odd inserts to verify rebalancing creates gaps
+    /// in the correct location for efficient insertion.
+    #[test]
+    fn test_interleaved_even_odd_inserts() {
+        let mut tree: BTreeMap<usize, usize> = BTreeMap::new(200);
+
+        // Insert even numbers: 0, 2, 4, ..., 198
+        for i in 0..100 {
+            tree.insert(i * 2, i);
+        }
+
+        // Insert odd numbers between them: 1, 3, 5, ..., 197
+        for i in 0..100 {
+            tree.insert(i * 2 + 1, i);
+        }
+
+        // All values should be retrievable
+        for i in 0..200 {
+            assert_eq!(tree.get(&i), Some(i / 2));
+        }
     }
 }
