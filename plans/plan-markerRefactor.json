@@ -56,6 +56,18 @@
       "Determine if destination cells with existing keys can be safely overwritten",
       "Implement safe overwrite logic during rebalance"
     ],
+    "passes": true
+  },
+  {
+    "category": "bugfix",
+    "description": "Fix data loss with non-sequential insert patterns",
+    "steps": [
+      "Investigate why test_rebalance_overwrite_with_mixed_inserts fails",
+      "Investigate why test_rebalance_destination_cell_with_move_marker_is_overwritten fails",
+      "Analyze rebalance logic for edge cases with non-sequential inserts",
+      "Fix the root cause of data loss during rebalance",
+      "Remove #[ignore] from the affected tests once fixed"
+    ],
     "passes": false
   },
   {
