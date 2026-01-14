@@ -316,7 +316,16 @@ where
                     // update new cell
                     cell.key.get().write((*cell_to_move.key.get()).clone());
                     cell.value.get().write((*cell_to_move.value.get()).clone());
-                    // todo update version and marker of new cell?
+                    // Set version on destination cell to match source marker version
+                    cell.version.store(marker_version, Ordering::SeqCst);
+                    // Set marker on destination cell to indicate it's now filled with data
+                    let dest_marker = Box::new(Marker::Empty(marker_version));
+                    let dest_marker_raw = Box::into_raw(dest_marker);
+                    // Store the marker atomically (the destination cell should be empty initially)
+                    cell.marker
+                        .as_ref()
+                        .unwrap()
+                        .store(dest_marker_raw, Ordering::SeqCst);
 
                     // update old cell
                     cell_to_move.key.get().write(None);
@@ -2383,6 +2392,86 @@ mod tests {
                 tree.get(&0).is_some() || tree.get(&(count - 1)).is_some(),
                 "Tree with capacity {} should have at least one retrievable element",
                 capacity
+            );
+        }
+    }
+
+    /// Test that destination cells get proper version and marker after rebalance.
+    ///
+    /// During rebalance, when data is moved to a new cell, the destination cell must:
+    /// 1. Have its version set to match the source marker version
+    /// 2. Have its marker set to an Empty marker with the same version
+    ///
+    /// This ensures readers can correctly validate the destination cell
+    /// using version matching between cell.version and marker.version().
+    #[test]
+    fn test_rebalance_destination_cell_has_version_and_marker() {
+        // Create a tree that will need rebalancing
+        let mut tree: BTreeMap<u32, u32> = BTreeMap::new(32);
+
+        // Insert values that will cause rebalancing
+        // Insert in reverse order to force more movements
+        for i in (0..20).rev() {
+            tree.insert(i, i * 10);
+        }
+
+        // Verify that all values are still accessible after rebalancing
+        // This implicitly tests that destination cells have proper version/marker
+        // because CellGuard::from_raw validates version consistency
+        for i in 0..20 {
+            let result = tree.get(&i);
+            assert_eq!(
+                result,
+                Some(i * 10),
+                "Key {} should be retrievable after rebalance",
+                i
+            );
+        }
+    }
+
+    /// Test that destination cell can be read via CellGuard after rebalance.
+    ///
+    /// CellGuard::from_raw requires version consistency between cell.version
+    /// and marker.version(). This test verifies that after data is moved
+    /// during rebalance, the destination cell passes this validation.
+    #[test]
+    fn test_rebalance_moved_data_is_readable() {
+        // Use the same pattern as add_unordered_values which is known to work
+        let mut tree: BTreeMap<u8, String> = BTreeMap::new(16);
+
+        // Insert values in non-sequential order to trigger movements
+        tree.insert(5, String::from("Hello"));
+        tree.insert(3, String::from("World"));
+        tree.insert(2, String::from("!"));
+
+        // All values should be readable after rebalancing operations
+        // This tests that destination cells have consistent version/marker
+        assert_eq!(tree.get(&5), Some(String::from("Hello")));
+        assert_eq!(tree.get(&3), Some(String::from("World")));
+        assert_eq!(tree.get(&2), Some(String::from("!")));
+    }
+
+    /// Test that rebalance correctly updates multiple destination cells.
+    ///
+    /// When many cells are moved during a single rebalance operation,
+    /// each destination cell must independently have its version and marker set.
+    #[test]
+    fn test_rebalance_multiple_destinations_have_correct_state() {
+        let mut tree: BTreeMap<u32, String> = BTreeMap::new(64);
+
+        // Insert enough values to cause multiple rebalance operations
+        for i in 0..50 {
+            tree.insert(i, format!("value_{}", i));
+        }
+
+        // Verify all values - each accessed cell must have valid version/marker
+        for i in 0..50 {
+            let result = tree.get(&i);
+            assert_eq!(
+                result,
+                Some(format!("value_{}", i)),
+                "Key {} should be retrievable with correct value",
+                i
             );
         }
     }

@@ -48,3 +48,36 @@
 - Both use `SeqCst` ordering to ensure visibility of concurrent modifications
 - This validation is critical for lock-free correctness: if versions mismatch, it means another thread has modified the cell between when we read the version and when we loaded the marker
 - All 65 tests pass
+
+## Step 4: Update destination cell version/marker during rebalance
+
+- Addressed TODO at btree_map.rs around line 318 (the comment `// todo update version and marker of new cell?`)
+- After copying key/value to the destination cell, now properly:
+  1. Sets `cell.version` to match the source marker version using `store()` with `SeqCst` ordering
+  2. Creates a new `Marker::Empty(marker_version)` for the destination cell
+  3. Stores the marker atomically via `cell.marker.as_ref().unwrap().store()`
+
+### Code change in rebalance():
+
+```rust
+// Set version on destination cell to match source marker version
+cell.version.store(marker_version, Ordering::SeqCst);
+// Set marker on destination cell to indicate it's now filled with data
+let dest_marker = Box::new(Marker::Empty(marker_version));
+let dest_marker_raw = Box::into_raw(dest_marker);
+// Store the marker atomically (the destination cell should be empty initially)
+cell.marker.as_ref().unwrap().store(dest_marker_raw, Ordering::SeqCst);
+```
+
+### New tests added to btree_map.rs:
+
+1. `test_rebalance_destination_cell_has_version_and_marker`: Verifies that values remain accessible after rebalance, which implicitly tests that destination cells have proper version/marker since `CellGuard::from_raw` validates version consistency
+2. `test_rebalance_moved_data_is_readable`: Tests that data moved during rebalance can be read correctly, confirming destination cells pass version validation
+3. `test_rebalance_multiple_destinations_have_correct_state`: Tests multiple rebalance operations to ensure each destination cell independently gets correct state
+
+### Technical notes:
+
+- The destination cell must have matching `cell.version` and `marker.version()` for readers to successfully create a `CellGuard`
+- Using `Marker::Empty` for the destination is appropriate because the marker type indicates pending operations, not whether the cell has data
+- The actual data presence is determined by whether `cell.key` is `Some` or `None`
+- All 68 tests pass

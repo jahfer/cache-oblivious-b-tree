@@ -36,7 +36,7 @@
       "Properly set version on newly-written destination cell",
       "Set marker on destination cell after moving data"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "category": "functional",
