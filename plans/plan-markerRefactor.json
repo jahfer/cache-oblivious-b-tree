@@ -87,9 +87,21 @@
     "category": "functional",
     "description": "Consider atomic CAS for neighbouring cells",
     "steps": [
-      "Investigate TODO at btree_map.rs#L270",
+      "Investigate TODO at btree_map.rs#L357",
       "Evaluate using compare_and_swap for neighbouring cells",
       "Prevent leaving cells unallocated during rebalance"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Implement read-through logic for cells being moved",
+    "steps": [
+      "ISSUE: During rebalance transition window, data may be temporarily inaccessible via get() if source cell is cleared but index not yet updated",
+      "When reader encounters cell with Move marker, follow dest_index to read from destination cell",
+      "This ensures data is always accessible during rebalance, not just after completion",
+      "Update get() to check Move marker and redirect to destination",
+      "Consider adding test that verifies accessibility DURING insert (not just after)"
     ],
     "passes": false
   },
