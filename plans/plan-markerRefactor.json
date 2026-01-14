@@ -62,13 +62,16 @@
     "category": "bugfix",
     "description": "Fix data loss with non-sequential insert patterns",
     "steps": [
-      "Investigate why test_rebalance_overwrite_with_mixed_inserts fails",
-      "Investigate why test_rebalance_destination_cell_with_move_marker_is_overwritten fails",
-      "Analyze rebalance logic for edge cases with non-sequential inserts",
-      "Fix the root cause of data loss during rebalance",
-      "Remove #[ignore] from the affected tests once fixed"
+      "ROOT CAUSE: After rebalance moves selected_cell RIGHT, insert writes new key into selected_cell's OLD position, breaking sorted order",
+      "Modify insert() to NOT use selected_cell's old position after rebalance",
+      "Option A: Have rebalance() return the new position of the first cell it moved",
+      "Option B: After rebalance(), re-scan to find correct insertion position (cell with largest key < insert_key)",
+      "Insert new key AFTER selected_cell's NEW position, not at its OLD position",
+      "Verify sorted invariant: all keys in PMA must be in ascending order by cell index",
+      "Remove #[ignore] from test_minimal_insert_between_two_keys and verify it passes",
+      "Remove #[ignore] from remaining affected tests once all pass"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "category": "bugfix",
