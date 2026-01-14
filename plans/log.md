@@ -507,3 +507,56 @@ if let Marker::Move(_, dest_index) = cache.marker {
 - 91 tests pass
 - 0 tests ignored
 - 0 tests failed
+
+## Step 11: Generalize active_range calculation
+
+- Addressed TODO at packed_memory_array.rs#L23 (`// TODO: Generalize this`)
+- Extracted active range computation into reusable helper functions
+
+### Code changes in packed_memory_array.rs:
+
+1. **Created `compute_active_range(cells: &[T]) -> Range<*const T>`**:
+
+   - Computes the active range for a given cell slice
+   - Uses `buffer_space()` helper for consistency
+   - Includes documentation explaining the buffer space concept
+
+2. **Created `buffer_space(total_capacity: usize) -> usize`**:
+
+   - Returns 1/4 of total capacity (`total_capacity >> 2`)
+   - Marked `#[inline]` for performance
+   - Documents that buffer space is reserved at each end for rebalancing
+
+3. **Refactored `new()` method**:
+
+   - Now calls `Self::compute_active_range(&cells)` instead of inline computation
+   - Cleaner, more maintainable code
+
+4. **Refactored `as_slice()` method**:
+   - Now uses `Self::buffer_space()` helper instead of duplicating the `>> 2` logic
+   - Ensures consistency between `active_range` and `as_slice()`
+
+### New tests added to packed_memory_array.rs:
+
+1. **`buffer_space_is_quarter_of_capacity`**: Verifies that `buffer_space()` correctly returns 1/4 of input values (16→4, 256→64, 1024→256, etc.)
+
+2. **`compute_active_range_correct_bounds`**: For a 16-element array, verifies active range is [4..12] (left buffer [0..4], active [4..12], right buffer [12..16])
+
+3. **`compute_active_range_larger_array`**: For a 256-element array, verifies active range is [64..192]
+
+4. **`active_range_matches_as_slice`**: Verifies that `compute_active_range()` produces pointers consistent with `as_slice()` - same start pointer and same length
+
+5. **`active_range_is_half_of_total_capacity`**: Verifies that active range is always exactly half the total capacity (since 1/4 is reserved on each side)
+
+### Technical notes:
+
+- The PMA uses a "gapped array" strategy where 1/4 of capacity is reserved at each end as buffer space for rebalancing operations
+- The active range (middle half) is where data is actually stored
+- The buffer space allows cells to be shifted during rebalance without reallocating the entire array
+- Extracting these helpers improves code maintainability and makes the design intent clearer
+
+**Final test results:**
+
+- 96 tests pass
+- 0 tests ignored
+- 0 tests failed

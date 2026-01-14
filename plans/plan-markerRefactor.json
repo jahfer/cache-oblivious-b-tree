@@ -112,7 +112,7 @@
       "Address TODO at packed_memory_array.rs#L23",
       "Extract active range computation into a reusable helper"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "category": "refactor",

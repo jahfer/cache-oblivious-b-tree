@@ -31,9 +31,33 @@ impl<T> PackedMemoryArray<T> {
         }
     }
 
+    /// Computes the active range for a given cell slice.
+    ///
+    /// The active range is the portion of the array where data can be stored.
+    /// The PMA reserves 1/4 of the total capacity at each end as buffer space
+    /// for rebalancing operations, leaving the middle half as the active range.
+    ///
+    /// # Example
+    /// For a 16-cell array:
+    /// - Left buffer: cells[0..4] (indices 0-3)
+    /// - Active range: cells[4..12] (indices 4-11)
+    /// - Right buffer: cells[12..16] (indices 12-15)
+    fn compute_active_range(cells: &[T]) -> Range<*const T> {
+        let buffer_space = Self::buffer_space(cells.len());
+        Range {
+            start: &cells[buffer_space] as *const _,
+            end: &cells[cells.len() - buffer_space] as *const _,
+        }
+    }
+
+    #[inline]
+    fn buffer_space(total_capacity: usize) -> usize {
+        total_capacity >> 2 // 1/4 of total capacity
+    }
+
     pub fn as_slice(&self) -> &[T] {
-        let left_buffer_space = self.cells.len() >> 2;
-        &self.cells[left_buffer_space..self.cells.len() - left_buffer_space]
+        let buffer = Self::buffer_space(self.cells.len());
+        &self.cells[buffer..self.cells.len() - buffer]
     }
 
     pub fn len(&self) -> usize {
@@ -296,6 +320,77 @@ mod tests {
         unsafe {
             assert_eq!(*range.start, 4);
             assert_eq!(*range.end, 12);
+        }
+    }
+
+    #[test]
+    fn buffer_space_is_quarter_of_capacity() {
+        // buffer_space should return 1/4 of the total capacity
+        assert_eq!(PackedMemoryArray::<i32>::buffer_space(16), 4);
+        assert_eq!(PackedMemoryArray::<i32>::buffer_space(256), 64);
+        assert_eq!(PackedMemoryArray::<i32>::buffer_space(1024), 256);
+        // Edge cases
+        assert_eq!(PackedMemoryArray::<i32>::buffer_space(4), 1);
+        assert_eq!(PackedMemoryArray::<i32>::buffer_space(8), 2);
+    }
+
+    #[test]
+    fn compute_active_range_correct_bounds() {
+        // For a 16-element array, active range should be [4..12]
+        // Left buffer: [0..4], Active: [4..12], Right buffer: [12..16]
+        let cells: Vec<i32> = vec![0; 16];
+        let active_range = PackedMemoryArray::compute_active_range(&cells);
+
+        let base_ptr = cells.as_ptr();
+        assert_eq!(active_range.start, unsafe { base_ptr.add(4) });
+        assert_eq!(active_range.end, unsafe { base_ptr.add(12) });
+    }
+
+    #[test]
+    fn compute_active_range_larger_array() {
+        // For a 256-element array:
+        // buffer_space = 256 / 4 = 64
+        // active range should be [64..192]
+        let cells: Vec<i32> = vec![0; 256];
+        let active_range = PackedMemoryArray::compute_active_range(&cells);
+
+        let base_ptr = cells.as_ptr();
+        assert_eq!(active_range.start, unsafe { base_ptr.add(64) });
+        assert_eq!(active_range.end, unsafe { base_ptr.add(192) });
+    }
+
+    #[test]
+    fn active_range_matches_as_slice() {
+        // Verify that compute_active_range produces pointers consistent with as_slice
+        let pma: PackedMemoryArray<i32> = PackedMemoryArray::with_capacity(16);
+        let slice = pma.as_slice();
+
+        // The active_range.start should point to the same address as the slice start
+        assert_eq!(pma.active_range.start, slice.as_ptr());
+
+        // The active_range length should match slice length
+        let range_len =
+            unsafe { pma.active_range.end.offset_from(pma.active_range.start) } as usize;
+        assert_eq!(range_len, slice.len());
+    }
+
+    #[test]
+    fn active_range_is_half_of_total_capacity() {
+        // The active range should always be exactly half the total capacity
+        // since we reserve 1/4 on each side
+        for &size in &[16, 64, 256] {
+            let cells: Vec<i32> = vec![0; size];
+            let active_range = PackedMemoryArray::compute_active_range(&cells);
+
+            let range_len = unsafe { active_range.end.offset_from(active_range.start) } as usize;
+            assert_eq!(
+                range_len,
+                size / 2,
+                "For size {}, active range should be {} but was {}",
+                size,
+                size / 2,
+                range_len
+            );
         }
     }
 }
