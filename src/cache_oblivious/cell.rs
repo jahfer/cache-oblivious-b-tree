@@ -252,7 +252,11 @@ impl<'a, K: Clone, V: Clone> CellGuard<'a, K, V> {
         let key = (*cell.key.get()).clone();
         let current_marker_raw = cell.marker.as_ref().unwrap().load(AtomicOrdering::SeqCst);
 
-        // TODO: Check version in marker to make sure the cell was not modified in between
+        // Check version in marker to make sure the cell was not modified in between
+        let marker_version = *(*current_marker_raw).version();
+        if version != marker_version {
+            return Err(Box::new(CellReadError {}));
+        }
 
         Ok(CellGuard {
             inner: cell,
@@ -301,5 +305,86 @@ impl<'a, K: Ord + Clone, V: Clone> Iterator for CellIterator<'a, K, V> {
 
         let guard = unsafe { CellGuard::from_raw(self.address) }.unwrap();
         Some(guard)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    #[test]
+    fn test_cell_guard_from_raw_with_matching_versions() {
+        // Create a cell with matching version (1) in both cell and marker
+        let cell: Cell<u32, String> = Cell::default();
+
+        // Default cell has version 1 and marker with version 1
+        let guard_result = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) };
+
+        assert!(
+            guard_result.is_ok(),
+            "CellGuard::from_raw should succeed when versions match"
+        );
+        let guard = guard_result.unwrap();
+        assert_eq!(guard.cache_version, 1);
+        assert!(guard.is_empty());
+    }
+
+    #[test]
+    fn test_cell_guard_from_raw_with_mismatched_versions() {
+        // Create a cell with version 1 in marker
+        let cell: Cell<u32, String> = Cell::default();
+
+        // Bump the cell version without updating the marker version
+        cell.version.store(2, AtomicOrdering::SeqCst);
+
+        // Now cell.version is 2 but marker.version() is still 1
+        let guard_result = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) };
+
+        assert!(
+            guard_result.is_err(),
+            "CellGuard::from_raw should fail when versions mismatch"
+        );
+    }
+
+    #[test]
+    fn test_cell_guard_from_raw_version_validation_detects_concurrent_modification() {
+        // This test simulates the scenario where a cell is modified between
+        // reading its version and creating the guard
+
+        // Create a cell with initial version
+        let marker = Box::new(Marker::<u32, String>::Empty(5));
+        let ptr = Box::into_raw(marker);
+        let cell = Cell::<u32, String>::new(ptr);
+        cell.version.store(5, AtomicOrdering::SeqCst);
+
+        // Versions match (both 5), so this should succeed
+        let guard_result = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) };
+        assert!(guard_result.is_ok(), "Should succeed when versions match");
+
+        // Now simulate a concurrent modification by changing cell version
+        cell.version.store(6, AtomicOrdering::SeqCst);
+
+        // Marker still has version 5, cell has version 6 - should fail
+        let guard_result = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) };
+        assert!(
+            guard_result.is_err(),
+            "Should fail when cell version differs from marker version"
+        );
+    }
+
+    #[test]
+    fn test_marker_version_accessor() {
+        let marker_empty = Marker::<u32, String>::Empty(42);
+        assert_eq!(*marker_empty.version(), 42);
+
+        let marker_move = Marker::<u32, String>::Move(17, 5);
+        assert_eq!(*marker_move.version(), 17);
+
+        let marker_insert = Marker::<u32, String>::InsertCell(99, 123, String::from("test"));
+        assert_eq!(*marker_insert.version(), 99);
+
+        let marker_delete = Marker::<u32, String>::DeleteCell(3, 456);
+        assert_eq!(*marker_delete.version(), 3);
     }
 }

@@ -1,0 +1,155 @@
+[
+  {
+    "category": "setup",
+    "description": "Add crossbeam-epoch dependency",
+    "steps": [
+      "Update Cargo.toml to include crossbeam-epoch = \"0.9\"",
+      "Familiarize with Atomic<T>, Owned, Shared, and Guard types"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Complete rebalance retry logic",
+    "steps": [
+      "Locate todo!() panics in btree_map.rs",
+      "Replace with proper retry loops",
+      "Restart rebalance operation on version mismatch or CAS failure"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Add version validation to CellGuard::from_ptr",
+    "steps": [
+      "Address TODO at cell.rs#L255",
+      "Check that marker's embedded version matches cell version",
+      "Return valid guard only when versions match"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Update destination cell version/marker during rebalance",
+    "steps": [
+      "Address TODO at btree_map.rs#L318",
+      "Properly set version on newly-written destination cell",
+      "Set marker on destination cell after moving data"
+    ],
+    "passes": false
+  },
+  {
+    "category": "functional",
+    "description": "Complete old cell cleanup after move",
+    "steps": [
+      "Address TODO at btree_map.rs#L339",
+      "Increment source cell's version after contents are moved",
+      "Clear marker on source cell"
+    ],
+    "passes": false
+  },
+  {
+    "category": "functional",
+    "description": "Handle overwriting moved records",
+    "steps": [
+      "Address TODO at btree_map.rs#L277",
+      "Determine if destination cells with existing keys can be safely overwritten",
+      "Implement safe overwrite logic during rebalance"
+    ],
+    "passes": false
+  },
+  {
+    "category": "bugfix",
+    "description": "Fix suspicious into_iter() usage in rebalance",
+    "steps": [
+      "Address TODO at btree_map.rs#L292",
+      "Investigate self.data.into_iter().next() usage for destination index computation",
+      "Ensure correct base pointer is returned"
+    ],
+    "passes": false
+  },
+  {
+    "category": "functional",
+    "description": "Consider atomic CAS for neighbouring cells",
+    "steps": [
+      "Investigate TODO at btree_map.rs#L270",
+      "Evaluate using compare_and_swap for neighbouring cells",
+      "Prevent leaving cells unallocated during rebalance"
+    ],
+    "passes": false
+  },
+  {
+    "category": "refactor",
+    "description": "Generalize active_range calculation",
+    "steps": [
+      "Address TODO at packed_memory_array.rs#L23",
+      "Extract active range computation into a reusable helper"
+    ],
+    "passes": false
+  },
+  {
+    "category": "refactor",
+    "description": "Replace AtomicPtr with crossbeam_epoch::Atomic",
+    "steps": [
+      "Change marker: Option<AtomicPtr<Marker<K, V>>> in cell.rs",
+      "Update to marker: Atomic<Marker<K, V>>",
+      "Remove Option wrapper entirely"
+    ],
+    "passes": false
+  },
+  {
+    "category": "refactor",
+    "description": "Eliminate marker memory reuse pattern",
+    "steps": [
+      "Remove unsafe reuse at cell.rs#L151",
+      "Remove unsafe reuse at packed_memory_array.rs#L319",
+      "Allocate fresh Owned<Marker> instead",
+      "Defer-destroy old markers via Guard::defer_destroy()"
+    ],
+    "passes": false
+  },
+  {
+    "category": "refactor",
+    "description": "Thread Guard through read/write operations",
+    "steps": [
+      "Update cache() to accept or pin a crossbeam_epoch::Guard",
+      "Update update() to accept or pin a crossbeam_epoch::Guard",
+      "Update PMA iteration to use Guard",
+      "Ensure markers aren't reclaimed while readers hold references"
+    ],
+    "passes": false
+  },
+  {
+    "category": "refactor",
+    "description": "Split CellGuard into CellReadGuard / CellWriteGuard",
+    "steps": [
+      "Create CellWriteGuard that auto-commits version bump on Drop",
+      "CellWriteGuard defers marker destruction on Drop",
+      "Create CellReadGuard that holds epoch Guard",
+      "CellReadGuard keeps marker alive during access"
+    ],
+    "passes": false
+  },
+  {
+    "category": "refactor",
+    "description": "Encapsulate Cell fields as private",
+    "steps": [
+      "Hide version, marker, key, value fields",
+      "Implement try_claim() -> Option<CellWriteGuard>",
+      "Implement read(guard) -> Option<CellReadGuard>"
+    ],
+    "passes": false
+  },
+  {
+    "category": "documentation",
+    "description": "Add #[must_use], typed errors, and documentation",
+    "steps": [
+      "Annotate fallible methods with #[must_use]",
+      "Create CellError enum for typed errors",
+      "Add module-level documentation",
+      "Include state-transition diagram in docs",
+      "Add // SAFETY: comments for remaining unsafe blocks"
+    ],
+    "passes": false
+  }
+]
