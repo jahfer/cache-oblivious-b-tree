@@ -4,7 +4,7 @@ This plan restructures the marker-based concurrency mechanism to unify version t
 
 ### Steps
 
-1. [ ] **Add `crossbeam-epoch` dependency** — update [Cargo.toml](Cargo.toml) to include `crossbeam-epoch = "0.9"` and familiarize with `Atomic<T>`, `Owned`, `Shared`, and `Guard` types.
+1. [x] **Add `crossbeam-epoch` dependency** — update [Cargo.toml](Cargo.toml) to include `crossbeam-epoch = "0.9"` and familiarize with `Atomic<T>`, `Owned`, `Shared`, and `Guard` types.
 
 2. [ ] **Complete rebalance retry logic** — replace the six `todo!()` panics in [btree_map.rs#L283-L333](src/cache_oblivious/btree_map.rs#L283-L333) with proper retry loops that restart the rebalance operation on version mismatch or CAS failure.
 

@@ -6,6 +6,7 @@ edition = "2018"
 
 [dependencies]
 num-rational = "0.3"
+crossbeam-epoch = "0.9"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 jemallocator = "0.3.0"
