@@ -81,7 +81,7 @@
       "Investigate self.data.into_iter().next() usage for destination index computation",
       "Ensure correct base pointer is returned"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "category": "functional",
@@ -164,6 +164,20 @@
       "Add module-level documentation",
       "Include state-transition diagram in docs",
       "Add // SAFETY: comments for remaining unsafe blocks"
+    ],
+    "passes": false
+  },
+  {
+    "category": "performance",
+    "description": "Fix superlinear insert scaling",
+    "steps": [
+      "ROOT CAUSE: The data loss fix (Step 7) resets gap tracking when finding a new predecessor, causing unnecessary rebalances when gaps exist but are 'before' the insertion point",
+      "Current behavior: Insert [even numbers], then insert [odd numbers between them] triggers ~15x scaling instead of expected <3x",
+      "Option A: Implement local compaction - when gap is before predecessor, move predecessor left into gap to create new gap after it. Note: I don't think this is viable as we should never shift a cell LEFTward",
+      "Option B: Track multiple gaps during scan and select the best one (closest to insertion point)",
+      "Option C: Modify rebalance to be more targeted - only shift cells from predecessor to first cell > insert_key",
+      "Restore test_insert_scaling_is_sublinear threshold from 20x back to 3x",
+      "Verify O(log N) or O(log² N) scaling, not O(N)"
     ],
     "passes": false
   }

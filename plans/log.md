@@ -299,3 +299,65 @@ The fix causes more rebalances when gaps are in "wrong" positions. The `test_ins
 - 79 tests pass
 - 0 tests ignored
 - 0 tests failed
+
+## Step 8: Fix suspicious into_iter() usage in rebalance
+
+- Addressed TODO at btree_map.rs around line 420 (the comment `// todo: self.data.into_iter() seems suspicious here`)
+- Replaced indirect `self.data.into_iter().next().unwrap() as *const Cell<K, V>` with direct `self.data.active_range.start`
+
+### The issue:
+
+The original code computed `dest_index` (the destination index for a Move marker) using:
+
+```rust
+// todo: self.data.into_iter() seems suspicious here
+let dest_index = unsafe {
+    current_cell_ptr
+        .offset_from(self.data.into_iter().next().unwrap() as *const Cell<K, V>)
+};
+```
+
+This was suspicious because:
+
+1. It created an iterator just to get its first element
+2. It relied on deref coercion from `Arc<PackedMemoryArray>` to `&PackedMemoryArray`
+3. It was not immediately obvious that `into_iter().next()` returns the start of the active range
+4. It had unnecessary overhead from creating an iterator
+
+### The fix:
+
+Replaced with direct access to `active_range.start`:
+
+```rust
+// Compute destination index relative to the start of the active range.
+// This index is stored in the Move marker so readers can follow the move
+// if they encounter a cell that has been relocated during rebalance.
+let dest_index = unsafe {
+    current_cell_ptr.offset_from(self.data.active_range.start)
+};
+```
+
+### Why this is semantically correct:
+
+- `self.data.active_range.start` is a `*const Cell<K, V>` pointing to the first cell in the active range
+- `into_iter().next()` returned a `&Cell<K, V>` pointing to the same location
+- Both give the same base pointer for computing the offset
+- The direct access is clearer, more efficient, and easier to understand
+
+### New tests added to btree_map.rs:
+
+1. `test_move_marker_dest_index_uses_active_range_start`: Verifies that `into_iter().next()` and `active_range.start` return the same pointer, and both are valid within the PMA bounds.
+
+2. `test_rebalance_dest_index_computation_correctness`: Exercises multiple rebalances with non-sequential inserts to ensure the dest_index computation works correctly in practice.
+
+### Technical notes:
+
+- The `Move(version, dest_index)` marker stores an index relative to the active range start
+- This index is currently not used by readers (the dest_index field is ignored when pattern matching), but it's stored for potential future use when readers need to follow cell relocations
+- Using `active_range.start` directly is the canonical way to get the base pointer for index computation throughout the codebase
+
+**Final test results:**
+
+- 81 tests pass
+- 0 tests ignored
+- 0 tests failed

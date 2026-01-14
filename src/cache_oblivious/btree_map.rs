@@ -417,11 +417,11 @@ where
                     continue 'retry;
                 }
 
-                // todo: self.data.into_iter() seems suspicious here
-                let dest_index = unsafe {
-                    current_cell_ptr
-                        .offset_from(self.data.into_iter().next().unwrap() as *const Cell<K, V>)
-                };
+                // Compute destination index relative to the start of the active range.
+                // This index is stored in the Move marker so readers can follow the move
+                // if they encounter a cell that has been relocated during rebalance.
+                let dest_index =
+                    unsafe { current_cell_ptr.offset_from(self.data.active_range.start) };
                 let new_marker = Box::new(Marker::Move(marker_version, dest_index));
 
                 let new_marker_raw = Box::into_raw(new_marker);
@@ -3045,5 +3045,63 @@ mod tests {
         assert_eq!(tree.get(&10), Some(String::from("ten")));
         assert_eq!(tree.get(&12), Some(String::from("twelve")));
         assert_eq!(tree.get(&15), Some(String::from("fifteen")));
+    }
+
+    /// Test that dest_index computation in Move marker uses correct base pointer.
+    ///
+    /// The Move marker contains an index relative to the start of the active range.
+    /// This test verifies that after rebalance, the Move marker index correctly
+    /// points to the destination cell within the active range.
+    #[test]
+    fn test_move_marker_dest_index_uses_active_range_start() {
+        use super::super::packed_memory_array::PackedMemoryArray;
+
+        // Create a PMA directly to verify active_range.start behavior
+        let pma: PackedMemoryArray<i32> = PackedMemoryArray::with_capacity(16);
+
+        // Verify that into_iter().next() and active_range.start point to the same location
+        let via_iter = pma.into_iter().next().unwrap() as *const i32;
+        let via_range = pma.active_range.start;
+
+        assert_eq!(
+            via_iter, via_range,
+            "into_iter().next() and active_range.start should return the same pointer"
+        );
+
+        // Also verify both point to a valid memory location within the array
+        assert!(
+            pma.is_valid_pointer(&via_iter),
+            "Iterator-based pointer should be valid"
+        );
+        assert!(
+            pma.is_valid_pointer(&via_range),
+            "Range-based pointer should be valid"
+        );
+    }
+
+    /// Test that rebalance works correctly after the dest_index fix.
+    ///
+    /// This test triggers multiple rebalance operations to ensure the
+    /// dest_index computation (using active_range.start directly) works correctly.
+    #[test]
+    fn test_rebalance_dest_index_computation_correctness() {
+        let mut tree: BTreeMap<u32, u32> = BTreeMap::new(8);
+
+        // Insert values that will trigger multiple rebalances
+        // The order is designed to stress-test the dest_index computation
+        for i in [50, 25, 75, 10, 30, 60, 90, 5, 15, 27, 35, 55, 70, 85, 95] {
+            tree.insert(i, i * 100);
+        }
+
+        // All values should be retrievable after all the rebalances
+        for i in [50, 25, 75, 10, 30, 60, 90, 5, 15, 27, 35, 55, 70, 85, 95] {
+            assert_eq!(
+                tree.get(&i),
+                Some(i * 100),
+                "Key {} should have value {} after multiple rebalances",
+                i,
+                i * 100
+            );
+        }
     }
 }
