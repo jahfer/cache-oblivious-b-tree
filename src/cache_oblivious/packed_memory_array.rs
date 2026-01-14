@@ -5,6 +5,31 @@ use std::ops::Range;
 use std::ops::RangeInclusive;
 use std::pin::Pin;
 
+/// A packed memory array (PMA) providing cache-oblivious storage.
+///
+/// The PMA maintains cells in a "gapped array" layout where 1/4 of capacity
+/// is reserved as buffer space on each end, leaving the middle half as the
+/// active storage region. This enables efficient rebalancing without
+/// reallocating the entire array.
+///
+/// # Memory Layout
+///
+/// ```text
+/// ┌─────────────┬────────────────────────────┬─────────────┐
+/// │  Left Buffer│       Active Range         │Right Buffer │
+/// │    (1/4)    │         (1/2)              │   (1/4)     │
+/// └─────────────┴────────────────────────────┴─────────────┘
+/// ```
+///
+/// # Density Invariants
+///
+/// The PMA maintains density bounds at each level of the implicit tree:
+/// - Minimum density: Ensures blocks aren't too sparse (wastes memory)
+/// - Maximum density: Ensures blocks aren't too full (requires rebalance)
+///
+/// Density bounds are more strict at lower levels (smaller ranges) and
+/// more relaxed at higher levels (larger ranges), enabling amortized
+/// O(log² N) insert cost.
 pub struct PackedMemoryArray<T> {
     cells: Pin<Box<[T]>>,
     pub config: Config,
@@ -13,10 +38,17 @@ pub struct PackedMemoryArray<T> {
     _pin: PhantomPinned,
 }
 
+// SAFETY: PackedMemoryArray is Send because Pin<Box<[T]>> is Send when T: Send,
+// and raw pointers in active_range point into the pinned allocation
 unsafe impl<T> Send for PackedMemoryArray<T> {}
+
+// SAFETY: PackedMemoryArray is Sync because:
+// - The cells are pinned and won't move
+// - Access to cells goes through proper synchronization (atomic/CAS)
 unsafe impl<T> Sync for PackedMemoryArray<T> {}
 
 impl<T> PackedMemoryArray<T> {
+    /// Creates a new PMA with the given cells and requested capacity.
     pub fn new(cells: Box<[T]>, capacity: usize) -> PackedMemoryArray<T> {
         let active_range = Self::compute_active_range(&cells);
         let density_scale = Self::compute_density_range(cells.len() as f32);
@@ -31,9 +63,33 @@ impl<T> PackedMemoryArray<T> {
         }
     }
 
+    /// Computes the active range for a given cell slice.
+    ///
+    /// The active range is the portion of the array where data can be stored.
+    /// The PMA reserves 1/4 of the total capacity at each end as buffer space
+    /// for rebalancing operations, leaving the middle half as the active range.
+    ///
+    /// # Example
+    /// For a 16-cell array:
+    /// - Left buffer: cells[0..4] (indices 0-3)
+    /// - Active range: cells[4..12] (indices 4-11)
+    /// - Right buffer: cells[12..16] (indices 12-15)
+    fn compute_active_range(cells: &[T]) -> Range<*const T> {
+        let buffer_space = Self::buffer_space(cells.len());
+        Range {
+            start: &cells[buffer_space] as *const _,
+            end: &cells[cells.len() - buffer_space] as *const _,
+        }
+    }
+
+    #[inline]
+    fn buffer_space(total_capacity: usize) -> usize {
+        total_capacity >> 2 // 1/4 of total capacity
+    }
+
     pub fn as_slice(&self) -> &[T] {
-        let left_buffer_space = self.cells.len() >> 2;
-        &self.cells[left_buffer_space..self.cells.len() - left_buffer_space]
+        let buffer = Self::buffer_space(self.cells.len());
+        &self.cells[buffer..self.cells.len() - buffer]
     }
 
     pub fn len(&self) -> usize {
@@ -42,15 +98,6 @@ impl<T> PackedMemoryArray<T> {
 
     pub fn is_valid_pointer(&self, ptr: &*const T) -> bool {
         self.active_range.contains(ptr)
-    }
-    /// Computes the active range of a slice, excluding buffer regions on both ends.
-    /// The buffer space is 1/4 of the total length on each side.
-    fn compute_active_range(cells: &[T]) -> Range<*const T> {
-        let buffer_space = cells.len() >> 2;
-        Range {
-            start: &cells[buffer_space] as *const _,
-            end: &cells[cells.len() - buffer_space] as *const _,
-        }
     }
 
     fn compute_density_range(cell_count: f32) -> Vec<Density> {
@@ -148,6 +195,8 @@ impl<'a, T> std::iter::IntoIterator for &'a PackedMemoryArray<T> {
         }
     }
 }
+
+/// Iterator over elements in the active range of a PMA.
 pub struct Iter<'a, T> {
     ptr: *const T,
     active_range: Range<*const T>,
@@ -161,28 +210,36 @@ impl<'a, T> Iterator for Iter<'a, T> {
         if self.at_start {
             self.at_start = false;
         } else {
+            // SAFETY: We're within the allocated PMA array (checked against active_range.end)
             let new_address = unsafe { self.ptr.add(1) };
             if new_address > self.active_range.end {
                 return None;
             }
             self.ptr = new_address;
         }
+        // SAFETY: ptr is within [active_range.start, active_range.end]
+        // and the PMA is pinned, so the memory remains valid
         Some(unsafe { &*self.ptr })
     }
 
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        // SAFETY: We check against active_range.end before dereferencing
         let new_address = unsafe { self.active_range.start.add(n) };
         if new_address > self.active_range.end {
             return None;
         }
         self.ptr = new_address;
+        // SAFETY: ptr is within [active_range.start, active_range.end]
         Some(unsafe { &*self.ptr })
     }
 }
+
+/// Configuration for density bounds at each level of the PMA.
 pub struct Config {
     pub density_scale: Vec<Density>,
 }
 
+/// Density bounds for a specific range size.
 pub struct Density {
     pub max_item_count: usize,
     pub range: RangeInclusive<Rational>,
@@ -296,6 +353,77 @@ mod tests {
         unsafe {
             assert_eq!(*range.start, 4);
             assert_eq!(*range.end, 12);
+        }
+    }
+
+    #[test]
+    fn buffer_space_is_quarter_of_capacity() {
+        // buffer_space should return 1/4 of the total capacity
+        assert_eq!(PackedMemoryArray::<i32>::buffer_space(16), 4);
+        assert_eq!(PackedMemoryArray::<i32>::buffer_space(256), 64);
+        assert_eq!(PackedMemoryArray::<i32>::buffer_space(1024), 256);
+        // Edge cases
+        assert_eq!(PackedMemoryArray::<i32>::buffer_space(4), 1);
+        assert_eq!(PackedMemoryArray::<i32>::buffer_space(8), 2);
+    }
+
+    #[test]
+    fn compute_active_range_correct_bounds() {
+        // For a 16-element array, active range should be [4..12]
+        // Left buffer: [0..4], Active: [4..12], Right buffer: [12..16]
+        let cells: Vec<i32> = vec![0; 16];
+        let active_range = PackedMemoryArray::compute_active_range(&cells);
+
+        let base_ptr = cells.as_ptr();
+        assert_eq!(active_range.start, unsafe { base_ptr.add(4) });
+        assert_eq!(active_range.end, unsafe { base_ptr.add(12) });
+    }
+
+    #[test]
+    fn compute_active_range_larger_array() {
+        // For a 256-element array:
+        // buffer_space = 256 / 4 = 64
+        // active range should be [64..192]
+        let cells: Vec<i32> = vec![0; 256];
+        let active_range = PackedMemoryArray::compute_active_range(&cells);
+
+        let base_ptr = cells.as_ptr();
+        assert_eq!(active_range.start, unsafe { base_ptr.add(64) });
+        assert_eq!(active_range.end, unsafe { base_ptr.add(192) });
+    }
+
+    #[test]
+    fn active_range_matches_as_slice() {
+        // Verify that compute_active_range produces pointers consistent with as_slice
+        let pma: PackedMemoryArray<i32> = PackedMemoryArray::with_capacity(16);
+        let slice = pma.as_slice();
+
+        // The active_range.start should point to the same address as the slice start
+        assert_eq!(pma.active_range.start, slice.as_ptr());
+
+        // The active_range length should match slice length
+        let range_len =
+            unsafe { pma.active_range.end.offset_from(pma.active_range.start) } as usize;
+        assert_eq!(range_len, slice.len());
+    }
+
+    #[test]
+    fn active_range_is_half_of_total_capacity() {
+        // The active range should always be exactly half the total capacity
+        // since we reserve 1/4 on each side
+        for &size in &[16, 64, 256] {
+            let cells: Vec<i32> = vec![0; size];
+            let active_range = PackedMemoryArray::compute_active_range(&cells);
+
+            let range_len = unsafe { active_range.end.offset_from(active_range.start) } as usize;
+            assert_eq!(
+                range_len,
+                size / 2,
+                "For size {}, active range should be {} but was {}",
+                size,
+                size / 2,
+                range_len
+            );
         }
     }
 }

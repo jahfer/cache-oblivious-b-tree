@@ -1,0 +1,129 @@
+[
+  {
+    "category": "setup",
+    "description": "Add crossbeam-epoch dependency",
+    "steps": [
+      "Update Cargo.toml to include crossbeam-epoch = \"0.9\"",
+      "Familiarize with Atomic<T>, Owned, Shared, and Guard types"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Complete rebalance retry logic",
+    "steps": [
+      "Locate todo!() panics in btree_map.rs",
+      "Replace with proper retry loops",
+      "Restart rebalance operation on version mismatch or CAS failure"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Add version validation to CellGuard::from_ptr",
+    "steps": [
+      "Address TODO at cell.rs#L255",
+      "Check that marker's embedded version matches cell version",
+      "Return valid guard only when versions match"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Update destination cell version/marker during rebalance",
+    "steps": [
+      "Address TODO at btree_map.rs#L318",
+      "Properly set version on newly-written destination cell",
+      "Set marker on destination cell after moving data"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Complete old cell cleanup after move",
+    "steps": [
+      "Address TODO at btree_map.rs#L339",
+      "Increment source cell's version after contents are moved",
+      "Clear marker on source cell"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Handle overwriting moved records",
+    "steps": [
+      "Address TODO at btree_map.rs#L277",
+      "Determine if destination cells with existing keys can be safely overwritten",
+      "Implement safe overwrite logic during rebalance"
+    ],
+    "passes": true
+  },
+  {
+    "category": "bugfix",
+    "description": "Fix data loss with non-sequential insert patterns",
+    "steps": [
+      "ROOT CAUSE: After rebalance moves selected_cell RIGHT, insert writes new key into selected_cell's OLD position, breaking sorted order",
+      "Modify insert() to NOT use selected_cell's old position after rebalance",
+      "Option A: Have rebalance() return the new position of the first cell it moved",
+      "Option B: After rebalance(), re-scan to find correct insertion position (cell with largest key < insert_key)",
+      "Insert new key AFTER selected_cell's NEW position, not at its OLD position",
+      "Verify sorted invariant: all keys in PMA must be in ascending order by cell index",
+      "Remove #[ignore] from test_minimal_insert_between_two_keys and verify it passes",
+      "Remove #[ignore] from remaining affected tests once all pass"
+    ],
+    "passes": true
+  },
+  {
+    "category": "bugfix",
+    "description": "Fix suspicious into_iter() usage in rebalance",
+    "steps": [
+      "Address TODO at btree_map.rs#L292",
+      "Investigate self.data.into_iter().next() usage for destination index computation",
+      "Ensure correct base pointer is returned"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Consider atomic CAS for neighbouring cells",
+    "steps": [
+      "Investigate TODO at btree_map.rs#L357",
+      "Evaluate using compare_and_swap for neighbouring cells",
+      "Prevent leaving cells unallocated during rebalance"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Implement read-through logic for cells being moved",
+    "steps": [
+      "ISSUE: During rebalance transition window, data may be temporarily inaccessible via get() if source cell is cleared but index not yet updated",
+      "When reader encounters cell with Move marker, follow dest_index to read from destination cell",
+      "This ensures data is always accessible during rebalance, not just after completion",
+      "Update get() to check Move marker and redirect to destination",
+      "Consider adding test that verifies accessibility DURING insert (not just after)"
+    ],
+    "passes": true
+  },
+  {
+    "category": "refactor",
+    "description": "Generalize active_range calculation",
+    "steps": [
+      "Address TODO at packed_memory_array.rs#L23",
+      "Extract active range computation into a reusable helper"
+    ],
+    "passes": true
+  },
+  {
+    "category": "documentation",
+    "description": "Add #[must_use], typed errors, and documentation",
+    "steps": [
+      "Annotate fallible methods with #[must_use]",
+      "Create CellError enum for typed errors",
+      "Add module-level documentation",
+      "Include state-transition diagram in docs",
+      "Add // SAFETY: comments for remaining unsafe blocks"
+    ],
+    "passes": true
+  }
+]
