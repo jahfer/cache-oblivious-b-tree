@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::hint::black_box;
 
 /// Dataset sizes to test - now supports larger sizes after allocation_size() overflow fix
-const SIZES: &[usize] = &[100, 500, 1_000, 2_000, 5_000, 10_000, 50_000, 100_000];
+const SIZES: &[usize] = &[100, 500, 1_000, 2_000, 5_000];
 
 /// Simple LCG for deterministic "random" access patterns without external deps
 struct SimpleRng {

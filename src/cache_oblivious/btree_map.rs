@@ -1137,6 +1137,9 @@ where
     }
 
     /// Search for a block using implicit vEB navigation.
+    ///
+    /// Returns the block containing the search key along with:
+    /// - min_key: the minimum key in this block
     fn find<Q>(&'a self, search_key: &Q, for_insertion: bool) -> SearchResult<'a, K, V>
     where
         K: Borrow<Q>,
@@ -1156,12 +1159,11 @@ where
                     }
                 }
                 Node::Internal { min_rhs } => {
-                    nav = if min_rhs.is_supremum()
-                        || key < Key::Value(min_rhs.clone().unwrap().borrow())
+                    if min_rhs.is_supremum() || key < Key::Value(min_rhs.clone().unwrap().borrow())
                     {
-                        self.left_child(&nav)
+                        nav = self.left_child(&nav);
                     } else {
-                        self.right_child(&nav)
+                        nav = self.right_child(&nav);
                     };
                 }
             }
@@ -1206,7 +1208,7 @@ where
         }
 
         // Propagate key changes up to ancestors if needed
-        self.propagate_key_change(pos, &new_min_key);
+        self.propagate_key_change(leaf_index, &new_min_key);
 
         true
     }
@@ -1218,58 +1220,54 @@ where
     /// If the updated leaf is the leftmost leaf of some node's right subtree,
     /// that node's `min_rhs` must be updated.
     ///
-    /// This walks from root to the leaf, updating `min_rhs` for any internal node
-    /// where we descend into the right child (meaning the leaf is in the right subtree).
-    fn propagate_key_change(&mut self, leaf_pos: usize, new_key: &Key<K>) {
-        let mut nav = self.root_navigator();
-        let mut path: Vec<(usize, bool)> = Vec::new(); // (position, went_right)
+    /// Uses bit manipulation to find the single ancestor that needs updating:
+    /// - Only the deepest node where we "turned right, then only left" needs min_rhs updated
+    /// - This corresponds to the least significant 1-bit in leaf_index
+    /// - Odd indices never need updates (they're rightmost in their subtree, not leftmost)
+    ///
+    /// This is allocation-free: we navigate directly to the target node without storing the path.
+    fn propagate_key_change(&mut self, leaf_index: usize, new_key: &Key<K>) {
+        let leaf_count = self.leaf_count();
 
-        // Walk from root to the target leaf, recording the path
-        loop {
-            if nav.position == leaf_pos {
-                break;
-            }
-
-            match &self.nodes[nav.position] {
-                Node::Leaf(_, _) => {
-                    // Reached a different leaf, shouldn't happen
-                    break;
-                }
-                Node::Internal { min_rhs } => {
-                    // Determine which way to go based on comparing new_key with min_rhs
-                    let go_right = !min_rhs.is_supremum() && new_key >= min_rhs;
-                    path.push((nav.position, go_right));
-
-                    nav = if go_right {
-                        self.right_child(&nav)
-                    } else {
-                        self.left_child(&nav)
-                    };
-                }
-            }
+        // No updates needed for:
+        // - Single leaf trees (no internal nodes)
+        // - Leaf 0 (all left turns, never in any right subtree)
+        // - Odd indices (rightmost of their subtree, never leftmost of a right subtree)
+        if leaf_count <= 1 || leaf_index == 0 || (leaf_index & 1) == 1 {
+            return;
         }
 
-        // Now update min_rhs for ancestors where we went right AND this is the leftmost
-        // leaf in that right subtree.
-        // We need to find where the updated leaf is the minimum of the right subtree.
-        // This happens when we go right, then only left from that point to the leaf.
+        // Compute the tree depth (number of levels from root to leaf)
+        let depth = (leaf_count - 1).ilog2() as usize + 1;
 
-        // Work backwards through the path to find the deepest "went_right" followed by only "went_left"
-        let mut all_left_from_here = true;
-        for (pos, went_right) in path.into_iter().rev() {
-            if *&went_right {
-                if all_left_from_here {
-                    // This node's min_rhs should be updated since the leaf is
-                    // the leftmost leaf in its right subtree
-                    if let Node::Internal { ref mut min_rhs } = self.nodes[pos] {
-                        *min_rhs = new_key.clone();
-                    }
-                }
-                // Once we hit a right turn, stop updating (nodes above this
-                // have the leaf in a deeper right subtree, not as their direct min_rhs)
-                all_left_from_here = false;
+        // The least significant 1-bit tells us the deepest level where we turned right
+        // and then only left. Example: leaf 6 = 0b110, trailing_zeros = 1, meaning at
+        // depth-1-1 = depth-2, we turned right then only left to reach this leaf.
+        let lsb_position = leaf_index.trailing_zeros() as usize;
+        let target_level = depth - 1 - lsb_position;
+
+        // Navigate from root to the target level (no allocation needed)
+        let mut nav = self.root_navigator();
+        for level in 0..target_level {
+            if !nav.is_valid() {
+                return;
             }
-            // If went_left, all_left_from_here stays true
+
+            let bit_position = depth - 1 - level;
+            let go_right = (leaf_index >> bit_position) & 1 == 1;
+
+            nav = if go_right {
+                self.right_child(&nav)
+            } else {
+                self.left_child(&nav)
+            };
+        }
+
+        // Update this node's min_rhs
+        if nav.is_valid() {
+            if let Node::Internal { ref mut min_rhs } = self.nodes[nav.position] {
+                *min_rhs = new_key.clone();
+            }
         }
     }
 }
