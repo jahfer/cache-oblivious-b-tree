@@ -4,7 +4,7 @@ use std::cmp::{Ord, Ordering};
 use std::error::Error;
 use std::fmt::{self, Debug, Display};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicPtr, AtomicU16, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicIsize, AtomicU16, AtomicU8, Ordering as AtomicOrdering};
 
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, PartialOrd, Clone, Copy)]
@@ -69,37 +69,84 @@ impl<'a, T: Ord> From<&'a Key<T>> for Key<&'a T> {
 /// a thread sets a marker indicating the operation in progress. Other threads
 /// can observe this marker to coordinate access.
 ///
-/// Each marker variant contains a version number that must match the cell's
-/// version for a read to be considered valid.
-///
 /// # State Transitions
 ///
-/// - `Empty(v)` → `InsertCell(v, k, val)` → `Empty(v+1)`: Insert operation
-/// - `Empty(v)` → `Move(v, dest)` → `Empty(v+1)`: Rebalance operation
-/// - `Empty(v)` → `DeleteCell(v, k)` → `Empty(v+1)`: Delete operation
-#[derive(Debug, Copy, Clone)]
-pub enum Marker<K: Clone, V: Clone> {
+/// - `Empty` → `Inserting` → `Empty`: Insert operation
+/// - `Empty` → `Move` → `Empty`: Rebalance operation
+/// - `Empty` → `Deleting` → `Empty`: Delete operation
+///
+/// The version number is stored separately in the Cell's `version` field.
+/// The `move_dest` field stores the destination index for Move operations.
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum MarkerState {
     /// Cell is idle and available for operations.
     /// Contains committed data if key/value are `Some`, otherwise empty.
-    Empty(u16),
-    /// Cell's data is being moved to `dest_index` during rebalance.
-    /// Readers should follow the destination index to find the data.
-    Move(u16, isize),
-    /// An insert operation is in progress with the given key and value.
-    InsertCell(u16, K, V),
-    /// A delete operation is in progress for the given key.
-    DeleteCell(u16, K),
+    Empty = 0,
+    /// Cell's data is being moved during rebalance.
+    /// The destination index is stored in the Cell's `move_dest` field.
+    Move = 1,
+    /// An insert operation is in progress.
+    Inserting = 2,
+    /// A delete operation is in progress.
+    Deleting = 3,
 }
 
-impl<K: Clone, V: Clone> Marker<K, V> {
+impl MarkerState {
+    /// Converts a u8 to MarkerState. Returns Empty for invalid values.
+    #[inline]
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => MarkerState::Empty,
+            1 => MarkerState::Move,
+            2 => MarkerState::Inserting,
+            3 => MarkerState::Deleting,
+            _ => MarkerState::Empty,
+        }
+    }
+}
+
+/// Legacy Marker enum for backwards compatibility with existing code.
+/// This is now derived from the Cell's inline atomic fields.
+///
+/// Note: This enum no longer has type parameters since the marker state
+/// is now stored inline in the Cell and doesn't need to carry type information.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Marker {
+    /// Cell is idle and available for operations.
+    Empty(u16),
+    /// Cell's data is being moved to `dest_index` during rebalance.
+    Move(u16, isize),
+    /// An insert operation is in progress (key/value stored in cell fields).
+    InsertCell(u16),
+    /// A delete operation is in progress (key stored in cell fields).
+    DeleteCell(u16),
+}
+
+impl Marker {
     /// Returns a reference to the version number embedded in this marker.
     pub fn version(&self) -> &u16 {
         match self {
             Marker::Empty(v)
             | Marker::Move(v, _)
-            | Marker::InsertCell(v, _, _)
-            | Marker::DeleteCell(v, _) => v,
+            | Marker::InsertCell(v)
+            | Marker::DeleteCell(v) => v,
         }
+    }
+
+    /// Returns the MarkerState for this marker.
+    pub fn state(&self) -> MarkerState {
+        match self {
+            Marker::Empty(_) => MarkerState::Empty,
+            Marker::Move(_, _) => MarkerState::Move,
+            Marker::InsertCell(_) => MarkerState::Inserting,
+            Marker::DeleteCell(_) => MarkerState::Deleting,
+        }
+    }
+
+    /// Returns true if this is an Empty or Move marker (safe to overwrite during rebalance).
+    pub fn is_idle_or_move(&self) -> bool {
+        matches!(self, Marker::Empty(_) | Marker::Move(_, _))
     }
 }
 
@@ -109,49 +156,94 @@ impl<K: Clone, V: Clone> Marker<K, V> {
 /// primitives for lock-free concurrent access:
 ///
 /// - `version`: Monotonically increasing counter, incremented on each modification
-/// - `marker`: Points to a [`Marker`] indicating the current operation state
+/// - `marker_state`: The current operation state (Empty, Move, Inserting, Deleting)
+/// - `move_dest`: Destination index for Move operations (only valid when marker_state == Move)
 /// - `key`/`value`: The actual data stored in `UnsafeCell` for interior mutability
 ///
 /// # Thread Safety
 ///
 /// `Cell` implements `Send` and `Sync` because:
-/// - `version` is an `AtomicU16` with proper atomic operations
-/// - `marker` is an `AtomicPtr` with proper atomic operations
+/// - `version`, `marker_state`, and `move_dest` are atomics with proper operations
 /// - `key`/`value` access is guarded by version validation and marker checks
 ///
 /// The lock-free protocol ensures that concurrent readers and writers
 /// can operate safely without data races:
-/// 1. Writer sets marker to indicate operation in progress
+/// 1. Writer sets marker_state to indicate operation in progress
 /// 2. Writer modifies key/value
-/// 3. Writer increments version and updates marker to `Empty`
+/// 3. Writer increments version and updates marker_state to `Empty`
 /// 4. Readers validate version before and after reading to detect concurrent modifications
 pub struct Cell<K: Clone, V: Clone> {
     pub version: AtomicU16,
-    pub marker: Option<AtomicPtr<Marker<K, V>>>,
+    pub marker_state: AtomicU8,
+    pub move_dest: AtomicIsize,
     pub key: UnsafeCell<Option<K>>,
     pub value: UnsafeCell<Option<V>>,
 }
 
 // SAFETY: Cell is Send because all its fields can be safely transferred between threads:
-// - AtomicU16 and AtomicPtr are Send
+// - AtomicU16, AtomicU8, and AtomicIsize are Send
 // - UnsafeCell contents are protected by the version/marker protocol
-unsafe impl<K: Clone, V: Clone> Send for Cell<K, V> {}
+unsafe impl<K: Clone + Send, V: Clone + Send> Send for Cell<K, V> {}
 
 // SAFETY: Cell is Sync because concurrent access is safe through:
-// - Atomic operations on version and marker
+// - Atomic operations on version, marker_state, and move_dest
 // - Version validation preventing observation of partially-written data
-unsafe impl<K: Clone, V: Clone> Sync for Cell<K, V> {}
+unsafe impl<K: Clone + Sync, V: Clone + Sync> Sync for Cell<K, V> {}
 
 impl<K: Clone, V: Clone> Cell<K, V> {
-    /// Creates a new cell with the given marker pointer.
-    ///
-    /// The cell starts with version 1 and empty key/value slots.
-    pub fn new(marker_ptr: *mut Marker<K, V>) -> Cell<K, V> {
+    /// Creates a new empty cell with version 1 and Empty marker state.
+    pub fn new() -> Cell<K, V> {
         Cell {
             version: AtomicU16::new(1),
-            marker: Some(AtomicPtr::new(marker_ptr)),
+            marker_state: AtomicU8::new(MarkerState::Empty as u8),
+            move_dest: AtomicIsize::new(0),
             key: UnsafeCell::new(None),
             value: UnsafeCell::new(None),
+        }
+    }
+
+    /// Loads the current marker state.
+    #[inline]
+    pub fn load_marker_state(&self, ordering: AtomicOrdering) -> MarkerState {
+        MarkerState::from_u8(self.marker_state.load(ordering))
+    }
+
+    /// Atomically sets the marker state, returning the previous state.
+    #[inline]
+    pub fn swap_marker_state(
+        &self,
+        new_state: MarkerState,
+        ordering: AtomicOrdering,
+    ) -> MarkerState {
+        MarkerState::from_u8(self.marker_state.swap(new_state as u8, ordering))
+    }
+
+    /// Atomically compares and exchanges the marker state.
+    /// Returns Ok(old_state) on success, Err(current_state) on failure.
+    #[inline]
+    pub fn compare_exchange_marker_state(
+        &self,
+        expected: MarkerState,
+        new: MarkerState,
+        success: AtomicOrdering,
+        failure: AtomicOrdering,
+    ) -> Result<MarkerState, MarkerState> {
+        self.marker_state
+            .compare_exchange(expected as u8, new as u8, success, failure)
+            .map(MarkerState::from_u8)
+            .map_err(MarkerState::from_u8)
+    }
+
+    /// Reconstructs a Marker enum from the cell's atomic fields.
+    /// This is for backwards compatibility with code expecting the Marker enum.
+    pub fn load_marker(&self, ordering: AtomicOrdering) -> Marker {
+        let version = self.version.load(ordering);
+        let state = self.load_marker_state(ordering);
+        match state {
+            MarkerState::Empty => Marker::Empty(version),
+            MarkerState::Move => Marker::Move(version, self.move_dest.load(ordering)),
+            MarkerState::Inserting => Marker::InsertCell(version),
+            MarkerState::Deleting => Marker::DeleteCell(version),
         }
     }
 }
@@ -161,30 +253,17 @@ where
     K: Clone,
     V: Clone,
 {
-    /// Creates a default empty cell with version 1 and an `Empty(1)` marker.
+    /// Creates a default empty cell with version 1 and Empty marker state.
     fn default() -> Self {
-        let marker = Box::new(Marker::<K, V>::Empty(1));
-        let ptr = Box::into_raw(marker);
-        Cell::new(ptr)
-    }
-}
-
-impl<K: Clone, V: Clone> Drop for Cell<K, V> {
-    fn drop(&mut self) {
-        let ptr = self.marker.take().unwrap();
-        let marker = ptr.load(AtomicOrdering::Acquire);
-        // SAFETY: The marker was created via Box::into_raw and we have exclusive
-        // access during Drop (guaranteed by Rust's ownership rules).
-        // No other references can exist because Drop requires &mut self.
-        unsafe { drop(Box::from_raw(marker)) };
+        Cell::new()
     }
 }
 
 impl<K: Debug + Clone, V: Debug + Clone> Debug for Cell<K, V> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let version = self.version.load(AtomicOrdering::Acquire);
-        // SAFETY: marker pointer is always valid (set in new/default, only freed in drop)
-        let marker = unsafe { &*self.marker.as_ref().unwrap().load(AtomicOrdering::Acquire) };
+        let marker_state = self.load_marker_state(AtomicOrdering::Acquire);
+        let move_dest = self.move_dest.load(AtomicOrdering::Acquire);
         // SAFETY: Debug formatting only reads data; we accept potential inconsistency
         // as this is for debugging purposes only, not for correctness-critical reads
         let key = unsafe { &*self.key.get() };
@@ -195,7 +274,8 @@ impl<K: Debug + Clone, V: Debug + Clone> Debug for Cell<K, V> {
 
         dbg_struct
             .field("version", &version)
-            .field("marker", marker)
+            .field("marker_state", &marker_state)
+            .field("move_dest", &move_dest)
             .field("key", key)
             .field("value", value);
 
@@ -211,13 +291,13 @@ impl<K: Debug + Clone, V: Debug + Clone> Debug for Cell<K, V> {
 pub struct CellData<K: Clone, V: Clone> {
     pub key: K,
     pub value: V,
-    pub marker: Marker<K, V>,
+    pub marker: Marker,
 }
 
 /// A guard that provides safe access to a cell's data.
 ///
 /// `CellGuard` captures a consistent snapshot of a cell's state at creation time,
-/// including the version number and marker pointer. It provides lazy caching of
+/// including the version number and marker state. It provides lazy caching of
 /// the cell's key/value data with version validation on access.
 ///
 /// # Thread Safety
@@ -229,7 +309,8 @@ pub struct CellGuard<'a, K: 'a + Clone, V: 'a + Clone> {
     pub cache_version: u16,
     pub is_filled: bool,
     cache_data: OnceCell<Option<CellData<K, V>>>,
-    cache_marker_ptr: *mut Marker<K, V>,
+    cache_marker_state: MarkerState,
+    cache_move_dest: isize,
     _phantom: PhantomData<&'a Cell<K, V>>,
 }
 
@@ -237,6 +318,16 @@ impl<K: Clone, V: Clone> CellGuard<'_, K, V> {
     /// Returns `true` if this cell contains no key-value data.
     pub fn is_empty(&self) -> bool {
         !self.is_filled
+    }
+
+    /// Returns the cached marker state.
+    pub fn marker_state(&self) -> MarkerState {
+        self.cache_marker_state
+    }
+
+    /// Returns the cached move destination (only valid if marker_state is Move).
+    pub fn move_dest(&self) -> isize {
+        self.cache_move_dest
     }
 
     /// Retrieves and caches the cell's data with version validation.
@@ -265,19 +356,9 @@ impl<K: Clone, V: Clone> CellGuard<'_, K, V> {
         }
 
         let version = self.inner.version.load(AtomicOrdering::SeqCst);
-        let current_marker_raw = self
-            .inner
-            .marker
-            .as_ref()
-            .unwrap()
-            .load(AtomicOrdering::SeqCst);
 
         // Check version consistency BEFORE cloning any data
-        // SAFETY: current_marker_raw is guaranteed to be valid because:
-        // - It was loaded from an AtomicPtr that is always initialized with a valid Box::into_raw
-        // - The marker is only deallocated in Cell::drop, which requires exclusive access
-        let marker_version = unsafe { *(*current_marker_raw).version() };
-        if version != marker_version {
+        if version != self.cache_version {
             return Err(CellReadError {});
         }
 
@@ -290,8 +371,13 @@ impl<K: Clone, V: Clone> CellGuard<'_, K, V> {
         let result = if let Some(k) = key {
             // SAFETY: Same reasoning as above for key - validated consistent state
             let value = unsafe { (*self.inner.value.get()).clone() };
-            // SAFETY: current_marker_raw validity established above
-            let marker = unsafe { (*current_marker_raw).clone() };
+            // Reconstruct marker from cached state
+            let marker = match self.cache_marker_state {
+                MarkerState::Empty => Marker::Empty(self.cache_version),
+                MarkerState::Move => Marker::Move(self.cache_version, self.cache_move_dest),
+                MarkerState::Inserting => Marker::InsertCell(self.cache_version),
+                MarkerState::Deleting => Marker::DeleteCell(self.cache_version),
+            };
             Some(CellData {
                 key: k,
                 value: value.unwrap(),
@@ -306,45 +392,49 @@ impl<K: Clone, V: Clone> CellGuard<'_, K, V> {
         Ok(self.cache_data.get().unwrap())
     }
 
-    /// Atomically updates the cell's marker using compare-and-swap.
+    /// Atomically updates the cell's marker state using compare-and-swap.
     ///
-    /// This operation will succeed only if the marker hasn't been modified
-    /// since the guard was created. On success, returns the old marker pointer
-    /// which the caller is responsible for managing (typically by overwriting
-    /// its contents for reuse).
+    /// This operation will succeed only if the marker state hasn't been modified
+    /// since the guard was created.
+    ///
+    /// # Arguments
+    /// * `new_state` - The new marker state to set
+    /// * `new_move_dest` - The move destination (only used if new_state is Move)
     ///
     /// # Errors
     ///
     /// Returns [`CellWriteError`] if the CAS operation fails due to concurrent
     /// modification. The caller should typically retry the entire operation.
-    ///
-    /// # Memory Safety
-    ///
-    /// On failure, the newly allocated marker is immediately deallocated.
-    /// On success, the caller receives ownership of the old marker pointer.
     #[must_use = "this returns a Result that should be checked for errors"]
-    pub fn update(&mut self, marker: Marker<K, V>) -> Result<*mut Marker<K, V>, Box<dyn Error>> {
-        let boxed_marker = Box::new(marker);
-        let new_marker_raw = Box::into_raw(boxed_marker);
-        let result = self.inner.marker.as_ref().unwrap().compare_exchange(
-            self.cache_marker_ptr,
-            new_marker_raw,
+    pub fn update_marker_state(
+        &mut self,
+        new_state: MarkerState,
+        new_move_dest: isize,
+    ) -> Result<(), Box<dyn Error>> {
+        // Store move_dest BEFORE the CAS on marker_state.
+        // This ensures readers who see the Move state will always find a valid
+        // move_dest value - they may see a stale value if CAS fails, but that's
+        // harmless since the marker state won't indicate Move.
+        if new_state == MarkerState::Move {
+            self.inner
+                .move_dest
+                .store(new_move_dest, AtomicOrdering::SeqCst);
+        }
+
+        let result = self.inner.compare_exchange_marker_state(
+            self.cache_marker_state,
+            new_state,
             AtomicOrdering::SeqCst,
             AtomicOrdering::SeqCst,
         );
 
         if result.is_err() {
-            // Deallocate memory, try again next time
-            // SAFETY: new_marker_raw was just created via Box::into_raw above,
-            // and the CAS failed so we still own it exclusively
-            unsafe { drop(Box::from_raw(new_marker_raw)) };
-            // Marker has been updated by another process, start loop over
             return Err(Box::new(CellWriteError {}));
-        } else {
-            let old_marker_box = self.cache_marker_ptr;
-            self.cache_marker_ptr = new_marker_raw;
-            Ok(old_marker_box)
         }
+
+        self.cache_marker_state = new_state;
+        self.cache_move_dest = new_move_dest;
+        Ok(())
     }
 }
 
@@ -412,15 +502,14 @@ impl Error for CellWriteError {}
 impl<'a, K: Clone, V: Clone> CellGuard<'a, K, V> {
     /// Creates a `CellGuard` from a raw pointer to a `Cell`.
     ///
-    /// This function validates that the cell's version matches the marker's
-    /// embedded version before returning a valid guard.
+    /// This function captures the cell's current state (version, marker state,
+    /// move destination) for later validation.
     ///
     /// # Safety
     ///
     /// The caller must ensure that:
     /// - `ptr` points to a valid, properly aligned `Cell<K, V>`
     /// - The `Cell` will remain valid for the lifetime `'a`
-    /// - The `Cell`'s marker pointer is valid and non-null
     #[must_use = "this returns a Result that should be checked for errors"]
     pub unsafe fn from_raw(ptr: *const Cell<K, V>) -> Result<CellGuard<'a, K, V>, Box<dyn Error>> {
         // SAFETY: Caller guarantees ptr is valid and properly aligned
@@ -428,20 +517,15 @@ impl<'a, K: Clone, V: Clone> CellGuard<'a, K, V> {
         let version = cell.version.load(AtomicOrdering::SeqCst);
         // SAFETY: Caller guarantees cell is valid, so its key UnsafeCell is valid
         let key = (*cell.key.get()).clone();
-        let current_marker_raw = cell.marker.as_ref().unwrap().load(AtomicOrdering::SeqCst);
-
-        // Check version in marker to make sure the cell was not modified in between
-        // SAFETY: current_marker_raw loaded from valid AtomicPtr, always points to valid Marker
-        let marker_version = *(*current_marker_raw).version();
-        if version != marker_version {
-            return Err(Box::new(CellReadError {}));
-        }
+        let marker_state = cell.load_marker_state(AtomicOrdering::SeqCst);
+        let move_dest = cell.move_dest.load(AtomicOrdering::SeqCst);
 
         Ok(CellGuard {
             inner: cell,
             is_filled: key.is_some(),
             cache_version: version,
-            cache_marker_ptr: current_marker_raw,
+            cache_marker_state: marker_state,
+            cache_move_dest: move_dest,
             cache_data: OnceCell::new(),
             _phantom: PhantomData,
         })
@@ -514,77 +598,93 @@ mod tests {
 
     #[test]
     fn test_cell_guard_from_raw_with_matching_versions() {
-        // Create a cell with matching version (1) in both cell and marker
+        // Create a cell with default state
         let cell: Cell<u32, String> = Cell::default();
 
-        // Default cell has version 1 and marker with version 1
+        // Default cell has version 1 and Empty marker state
         let guard_result = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) };
 
-        assert!(
-            guard_result.is_ok(),
-            "CellGuard::from_raw should succeed when versions match"
-        );
+        assert!(guard_result.is_ok(), "CellGuard::from_raw should succeed");
         let guard = guard_result.unwrap();
         assert_eq!(guard.cache_version, 1);
         assert!(guard.is_empty());
+        assert_eq!(guard.marker_state(), MarkerState::Empty);
     }
 
     #[test]
-    fn test_cell_guard_from_raw_with_mismatched_versions() {
-        // Create a cell with version 1 in marker
+    fn test_cell_guard_detects_version_change_on_cache() {
+        // Create a cell with default state
         let cell: Cell<u32, String> = Cell::default();
 
-        // Bump the cell version without updating the marker version
+        // Create guard while version is 1
+        let guard_result = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) };
+        assert!(guard_result.is_ok());
+        let guard = guard_result.unwrap();
+
+        // Now change the version (simulating concurrent modification)
         cell.version.store(2, AtomicOrdering::SeqCst);
 
-        // Now cell.version is 2 but marker.version() is still 1
-        let guard_result = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) };
-
+        // Trying to cache should fail due to version mismatch
+        let cache_result = guard.cache();
         assert!(
-            guard_result.is_err(),
-            "CellGuard::from_raw should fail when versions mismatch"
+            cache_result.is_err(),
+            "cache() should fail when version changed"
         );
     }
 
     #[test]
-    fn test_cell_guard_from_raw_version_validation_detects_concurrent_modification() {
-        // This test simulates the scenario where a cell is modified between
-        // reading its version and creating the guard
-
-        // Create a cell with initial version
-        let marker = Box::new(Marker::<u32, String>::Empty(5));
-        let ptr = Box::into_raw(marker);
-        let cell = Cell::<u32, String>::new(ptr);
-        cell.version.store(5, AtomicOrdering::SeqCst);
-
-        // Versions match (both 5), so this should succeed
-        let guard_result = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) };
-        assert!(guard_result.is_ok(), "Should succeed when versions match");
-
-        // Now simulate a concurrent modification by changing cell version
-        cell.version.store(6, AtomicOrdering::SeqCst);
-
-        // Marker still has version 5, cell has version 6 - should fail
-        let guard_result = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) };
-        assert!(
-            guard_result.is_err(),
-            "Should fail when cell version differs from marker version"
-        );
+    fn test_marker_state_conversion() {
+        assert_eq!(MarkerState::from_u8(0), MarkerState::Empty);
+        assert_eq!(MarkerState::from_u8(1), MarkerState::Move);
+        assert_eq!(MarkerState::from_u8(2), MarkerState::Inserting);
+        assert_eq!(MarkerState::from_u8(3), MarkerState::Deleting);
+        assert_eq!(MarkerState::from_u8(255), MarkerState::Empty); // Invalid defaults to Empty
     }
 
     #[test]
     fn test_marker_version_accessor() {
-        let marker_empty = Marker::<u32, String>::Empty(42);
+        let marker_empty = Marker::Empty(42);
         assert_eq!(*marker_empty.version(), 42);
 
-        let marker_move = Marker::<u32, String>::Move(17, 5);
+        let marker_move = Marker::Move(17, 5);
         assert_eq!(*marker_move.version(), 17);
 
-        let marker_insert = Marker::<u32, String>::InsertCell(99, 123, String::from("test"));
+        let marker_insert = Marker::InsertCell(99);
         assert_eq!(*marker_insert.version(), 99);
 
-        let marker_delete = Marker::<u32, String>::DeleteCell(3, 456);
+        let marker_delete = Marker::DeleteCell(3);
         assert_eq!(*marker_delete.version(), 3);
+    }
+
+    #[test]
+    fn test_marker_state_method() {
+        let marker_empty = Marker::Empty(1);
+        assert_eq!(marker_empty.state(), MarkerState::Empty);
+
+        let marker_move = Marker::Move(1, 5);
+        assert_eq!(marker_move.state(), MarkerState::Move);
+
+        let marker_insert = Marker::InsertCell(1);
+        assert_eq!(marker_insert.state(), MarkerState::Inserting);
+
+        let marker_delete = Marker::DeleteCell(1);
+        assert_eq!(marker_delete.state(), MarkerState::Deleting);
+    }
+
+    #[test]
+    fn test_cell_load_marker() {
+        let cell: Cell<u32, String> = Cell::default();
+
+        // Default state
+        let marker = cell.load_marker(AtomicOrdering::SeqCst);
+        assert!(matches!(marker, Marker::Empty(1)));
+
+        // Set to Move state
+        cell.marker_state
+            .store(MarkerState::Move as u8, AtomicOrdering::SeqCst);
+        cell.move_dest.store(42, AtomicOrdering::SeqCst);
+        let marker = cell.load_marker(AtomicOrdering::SeqCst);
+        assert!(matches!(marker, Marker::Move(1, 42)));
     }
 
     #[test]

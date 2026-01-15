@@ -223,8 +223,8 @@ fn bench_mixed_workload(c: &mut Criterion) {
 /// Benchmark bulk loading followed by lookups - common initialization pattern.
 fn bench_bulk_load_then_query(c: &mut Criterion) {
     let mut group = c.benchmark_group("Bulk Load + Query");
-    let size: usize = 50_000;
-    let queries = 10_000usize;
+    let size: usize = 5_000;
+    let queries = 1_000usize;
 
     group.throughput(Throughput::Elements((size + queries) as u64));
 

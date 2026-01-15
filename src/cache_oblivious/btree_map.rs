@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 
 use num_rational::{Ratio, Rational};
 
-use super::cell::{Cell, CellGuard, CellIterator, Key, Marker};
+use super::cell::{Cell, CellGuard, CellIterator, Key, MarkerState};
 use super::packed_memory_array::PackedMemoryArray;
 
 /// Result of a rebalance operation, indicating which blocks (leaves) were affected.
@@ -116,16 +116,12 @@ where
                     continue;
                 } else if Key::Value(&cache.key) == Key::Value(&key) {
                     // Duplicate key - just overwrite the value
-                    let marker_version = cell_guard.cache_version + 1;
-                    let marker = Marker::InsertCell(marker_version, key.clone(), value.clone());
-
-                    let result = cell_guard.update(marker);
+                    let result = cell_guard.update_marker_state(MarkerState::Inserting, 0);
                     if result.is_err() {
                         continue;
                     }
 
-                    let prev_marker = result.unwrap();
-                    // SAFETY: We successfully set InsertCell marker, claiming exclusive
+                    // SAFETY: We successfully set Inserting marker, claiming exclusive
                     // write access to this cell's value. The CAS on marker succeeded,
                     // so no other thread can be writing to this cell simultaneously.
                     unsafe {
@@ -134,21 +130,16 @@ where
 
                     inserted_cell_ptr = Some(cell_guard.inner as *const Cell<K, V>);
 
-                    let next_version = marker_version + 1;
-                    // SAFETY: prev_marker was returned from update(), meaning we own
-                    // exclusive access to this memory. We reuse it by writing a new
-                    // marker value before swapping it back into the atomic pointer.
-                    unsafe { prev_marker.write(Marker::Empty(next_version)) };
-                    cell_guard
-                        .inner
-                        .marker
-                        .as_ref()
-                        .unwrap()
-                        .swap(prev_marker, Ordering::SeqCst);
+                    // Update version and reset marker to Empty
+                    let next_version = cell_guard.cache_version + 1;
                     cell_guard
                         .inner
                         .version
-                        .swap(next_version, Ordering::SeqCst);
+                        .store(next_version, Ordering::SeqCst);
+                    cell_guard
+                        .inner
+                        .marker_state
+                        .store(MarkerState::Empty as u8, Ordering::SeqCst);
 
                     break 'insert_retry;
                 } else {
@@ -156,16 +147,12 @@ where
                     // If we have an empty cell tracked, use it. Otherwise, rebalance.
                     if let Some(mut empty_cell) = first_empty_after_predecessor {
                         // Insert into the empty cell
-                        let marker_version = empty_cell.cache_version + 1;
-                        let marker = Marker::InsertCell(marker_version, key.clone(), value.clone());
-
-                        let result = empty_cell.update(marker);
+                        let result = empty_cell.update_marker_state(MarkerState::Inserting, 0);
                         if result.is_err() {
                             continue 'insert_retry;
                         }
 
-                        let prev_marker = result.unwrap();
-                        // SAFETY: We successfully set InsertCell marker via CAS,
+                        // SAFETY: We successfully set Inserting marker via CAS,
                         // claiming exclusive write access to this cell's key/value.
                         // No other thread can write to this cell while we hold the marker.
                         unsafe {
@@ -175,20 +162,16 @@ where
 
                         inserted_cell_ptr = Some(empty_cell.inner as *const Cell<K, V>);
 
-                        let next_version = marker_version + 1;
-                        // SAFETY: prev_marker ownership transferred from update(),
-                        // we can safely rewrite its contents before reusing.
-                        unsafe { prev_marker.write(Marker::Empty(next_version)) };
-                        empty_cell
-                            .inner
-                            .marker
-                            .as_ref()
-                            .unwrap()
-                            .swap(prev_marker, Ordering::SeqCst);
+                        // Update version and reset marker to Empty
+                        let next_version = empty_cell.cache_version + 1;
                         empty_cell
                             .inner
                             .version
-                            .swap(next_version, Ordering::SeqCst);
+                            .store(next_version, Ordering::SeqCst);
+                        empty_cell
+                            .inner
+                            .marker_state
+                            .store(MarkerState::Empty as u8, Ordering::SeqCst);
 
                         break 'insert_retry;
                     }
@@ -211,16 +194,12 @@ where
             // This means our key is the largest. If we have a tracked empty cell, use it.
             if let Some(mut empty_cell) = first_empty_after_predecessor {
                 // Insert into the empty cell
-                let marker_version = empty_cell.cache_version + 1;
-                let marker = Marker::InsertCell(marker_version, key.clone(), value.clone());
-
-                let result = empty_cell.update(marker);
+                let result = empty_cell.update_marker_state(MarkerState::Inserting, 0);
                 if result.is_err() {
                     continue 'insert_retry;
                 }
 
-                let prev_marker = result.unwrap();
-                // SAFETY: We successfully set InsertCell marker via CAS,
+                // SAFETY: We successfully set Inserting marker via CAS,
                 // claiming exclusive write access to this cell's key/value.
                 // No other thread can write to this cell while we hold the marker.
                 unsafe {
@@ -230,20 +209,16 @@ where
 
                 inserted_cell_ptr = Some(empty_cell.inner as *const Cell<K, V>);
 
-                let next_version = marker_version + 1;
-                // SAFETY: prev_marker ownership transferred from update(),
-                // we can safely rewrite its contents before reusing.
-                unsafe { prev_marker.write(Marker::Empty(next_version)) };
-                empty_cell
-                    .inner
-                    .marker
-                    .as_ref()
-                    .unwrap()
-                    .swap(prev_marker, Ordering::SeqCst);
+                // Update version and reset marker to Empty
+                let next_version = empty_cell.cache_version + 1;
                 empty_cell
                     .inner
                     .version
-                    .swap(next_version, Ordering::SeqCst);
+                    .store(next_version, Ordering::SeqCst);
+                empty_cell
+                    .inner
+                    .marker_state
+                    .store(MarkerState::Empty as u8, Ordering::SeqCst);
 
                 break 'insert_retry;
             }
@@ -436,19 +411,16 @@ where
                     //    when we process it later in this loop
                     //
                     // We can safely overwrite in both cases. However, if another operation is in
-                    // progress (InsertCell/DeleteCell marker), we should retry to avoid conflicts.
-                    let dest_marker_raw = cell.marker.as_ref().unwrap().load(Ordering::SeqCst);
-                    // SAFETY: dest_marker_raw loaded from valid AtomicPtr,
-                    // always points to a valid Marker allocated via Box::into_raw
-                    let dest_marker = unsafe { &*dest_marker_raw };
-                    match dest_marker {
-                        Marker::Move(_, _) | Marker::Empty(_) => {
+                    // progress (Inserting/Deleting marker), we should retry to avoid conflicts.
+                    let dest_marker_state = cell.load_marker_state(Ordering::SeqCst);
+                    match dest_marker_state {
+                        MarkerState::Move | MarkerState::Empty => {
                             // Safe to overwrite:
                             // - Move: cell's contents have already been copied to its destination
                             // - Empty: cell is in cells_to_move and will be processed later
                         }
                         _ => {
-                            // InsertCell or DeleteCell - another operation in progress
+                            // Inserting or Deleting - another operation in progress
                             // Restart rebalance to get fresh state
                             continue 'retry;
                         }
@@ -468,41 +440,38 @@ where
                 }
 
                 let version = cell_to_move.version.load(Ordering::SeqCst);
-                let current_marker_raw =
-                    cell_to_move.marker.as_ref().unwrap().load(Ordering::SeqCst);
-                // SAFETY: marker pointer loaded from AtomicPtr is always valid
-                // (created via Box::into_raw in Cell::new/default)
-                let marker = unsafe { &*current_marker_raw };
-                let marker_version = *marker.version();
+                let current_marker_state = cell_to_move.load_marker_state(Ordering::SeqCst);
 
-                if version != marker_version {
-                    // Version mismatch: cell was modified by another thread.
-                    // Restart the entire rebalance operation with fresh state.
+                // Only allow moving cells that are in Empty state
+                if current_marker_state != MarkerState::Empty {
+                    // Another operation in progress, restart
                     continue 'retry;
                 }
 
                 // Compute destination index relative to the start of the active range.
-                // This index is stored in the Move marker so readers can follow the move
+                // This index is stored in move_dest so readers can follow the move
                 // if they encounter a cell that has been relocated during rebalance.
                 // SAFETY: Both pointers are within the same allocated PMA array,
                 // so offset_from is well-defined
                 let dest_index = unsafe { dest_ptr.offset_from(self.data.active_range.start) };
-                let new_marker = Box::new(Marker::Move(marker_version, dest_index));
 
-                let new_marker_raw = Box::into_raw(new_marker);
-                let prev_marker = cell_to_move.marker.as_ref().unwrap().compare_exchange(
-                    current_marker_raw,
-                    new_marker_raw,
+                // Store the destination index BEFORE setting the Move marker.
+                // This ensures readers who see the Move state will always find a valid
+                // move_dest value. If the CAS fails, the stale move_dest is harmless
+                // since the marker state won't indicate Move.
+                cell_to_move.move_dest.store(dest_index, Ordering::SeqCst);
+
+                // Try to set Move marker via CAS
+                let cas_result = cell_to_move.compare_exchange_marker_state(
+                    MarkerState::Empty,
+                    MarkerState::Move,
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 );
 
-                if prev_marker.is_err() {
+                if cas_result.is_err() {
                     // CAS failure: marker was updated by another thread.
-                    // Deallocate our marker and restart the entire rebalance operation.
-                    // SAFETY: new_marker_raw was just created via Box::into_raw above,
-                    // and CAS failed so we still own it exclusively
-                    unsafe { drop(Box::from_raw(new_marker_raw)) };
+                    // Restart the entire rebalance operation.
                     continue 'retry;
                 }
 
@@ -515,27 +484,21 @@ where
                     // update new cell
                     cell.key.get().write((*cell_to_move.key.get()).clone());
                     cell.value.get().write((*cell_to_move.value.get()).clone());
-                    // Set version on destination cell to match source marker version
-                    cell.version.store(marker_version, Ordering::SeqCst);
+                    // Set version on destination cell to match source version
+                    cell.version.store(version, Ordering::SeqCst);
                     // Set marker on destination cell to indicate it's now filled with data
-                    let dest_marker = Box::new(Marker::Empty(marker_version));
-                    let dest_marker_raw = Box::into_raw(dest_marker);
-                    // Store the marker atomically (the destination cell should be empty initially)
-                    cell.marker
-                        .as_ref()
-                        .unwrap()
-                        .store(dest_marker_raw, Ordering::SeqCst);
+                    cell.marker_state
+                        .store(MarkerState::Empty as u8, Ordering::SeqCst);
 
                     // update old cell
                     cell_to_move.key.get().write(None);
                     cell_to_move.value.get().write(None);
                     let new_version = version + 1;
-                    // reuse prev_marker box
-                    prev_marker.unwrap().write(Marker::Empty(new_version));
-                    // use compare_exchange_weak because we can safely fail here
-                    let _ = cell_to_move.marker.as_ref().unwrap().compare_exchange_weak(
-                        new_marker_raw,
-                        prev_marker.unwrap(),
+                    // Update version and reset marker to Empty
+                    // Use compare_exchange_weak because we can safely fail here
+                    let _ = cell_to_move.version.compare_exchange_weak(
+                        version,
+                        new_version,
                         Ordering::SeqCst,
                         Ordering::SeqCst,
                     );
@@ -544,9 +507,9 @@ where
                     // version/marker updates fail (due to concurrent modification), readers
                     // will see an empty cell. The next operation on this cell will establish
                     // consistent version/marker state.
-                    let _ = cell_to_move.version.compare_exchange_weak(
-                        marker_version,
-                        new_version,
+                    let _ = cell_to_move.compare_exchange_marker_state(
+                        MarkerState::Move,
+                        MarkerState::Empty,
                         Ordering::SeqCst,
                         Ordering::SeqCst,
                     );
@@ -696,7 +659,8 @@ where
 
                         // Check for Move marker - if the cell's data was moved during rebalance,
                         // follow the dest_index to read from the destination cell.
-                        if let Marker::Move(_, dest_index) = cache.marker {
+                        if cell_guard.marker_state() == MarkerState::Move {
+                            let dest_index = cell_guard.move_dest();
                             // The dest_index is an offset from active_range.start
                             // SAFETY: dest_index was computed during rebalance via
                             // offset_from(active_range.start), so adding it back
@@ -2844,46 +2808,45 @@ mod tests {
     ///
     /// This test verifies that the overwrite logic correctly identifies cells
     /// by their marker state. The implementation allows overwriting cells with
-    /// Move or Empty markers, but should retry on InsertCell or DeleteCell markers.
+    /// Move or Empty markers, but should retry on Inserting or Deleting markers.
     #[test]
     fn test_rebalance_overwrite_allows_empty_and_move_markers() {
-        use super::super::cell::Marker;
+        use super::super::cell::MarkerState;
 
-        // Directly test the marker matching logic by creating markers
-        // and checking they match the expected pattern
-        let empty_marker = Marker::<u32, u32>::Empty(1);
-        let move_marker = Marker::<u32, u32>::Move(1, 5);
-        let insert_marker = Marker::<u32, u32>::InsertCell(1, 10, 100);
-        let delete_marker = Marker::<u32, u32>::DeleteCell(1, 10);
+        // Test the marker state matching logic
+        let empty_state = MarkerState::Empty;
+        let move_state = MarkerState::Move;
+        let insert_state = MarkerState::Inserting;
+        let delete_state = MarkerState::Deleting;
 
-        // Empty and Move markers should be safe to overwrite
-        match empty_marker {
-            Marker::Move(_, _) | Marker::Empty(_) => {
+        // Empty and Move states should be safe to overwrite
+        match empty_state {
+            MarkerState::Move | MarkerState::Empty => {
                 // Expected: safe to overwrite
             }
-            _ => panic!("Empty marker should match safe-to-overwrite pattern"),
+            _ => panic!("Empty state should match safe-to-overwrite pattern"),
         }
 
-        match move_marker {
-            Marker::Move(_, _) | Marker::Empty(_) => {
+        match move_state {
+            MarkerState::Move | MarkerState::Empty => {
                 // Expected: safe to overwrite
             }
-            _ => panic!("Move marker should match safe-to-overwrite pattern"),
+            _ => panic!("Move state should match safe-to-overwrite pattern"),
         }
 
-        // InsertCell and DeleteCell markers should trigger retry
-        match insert_marker {
-            Marker::Move(_, _) | Marker::Empty(_) => {
-                panic!("InsertCell marker should NOT match safe-to-overwrite pattern");
+        // Inserting and Deleting states should trigger retry
+        match insert_state {
+            MarkerState::Move | MarkerState::Empty => {
+                panic!("Inserting state should NOT match safe-to-overwrite pattern");
             }
             _ => {
                 // Expected: should retry
             }
         }
 
-        match delete_marker {
-            Marker::Move(_, _) | Marker::Empty(_) => {
-                panic!("DeleteCell marker should NOT match safe-to-overwrite pattern");
+        match delete_state {
+            MarkerState::Move | MarkerState::Empty => {
+                panic!("Deleting state should NOT match safe-to-overwrite pattern");
             }
             _ => {
                 // Expected: should retry
