@@ -132,8 +132,14 @@ where
 
                     // Update version and reset marker to Empty
                     let next_version = cell_guard.cache_version + 1;
-                    cell_guard.inner.version.store(next_version, Ordering::SeqCst);
-                    cell_guard.inner.marker_state.store(MarkerState::Empty as u8, Ordering::SeqCst);
+                    cell_guard
+                        .inner
+                        .version
+                        .store(next_version, Ordering::SeqCst);
+                    cell_guard
+                        .inner
+                        .marker_state
+                        .store(MarkerState::Empty as u8, Ordering::SeqCst);
 
                     break 'insert_retry;
                 } else {
@@ -158,8 +164,14 @@ where
 
                         // Update version and reset marker to Empty
                         let next_version = empty_cell.cache_version + 1;
-                        empty_cell.inner.version.store(next_version, Ordering::SeqCst);
-                        empty_cell.inner.marker_state.store(MarkerState::Empty as u8, Ordering::SeqCst);
+                        empty_cell
+                            .inner
+                            .version
+                            .store(next_version, Ordering::SeqCst);
+                        empty_cell
+                            .inner
+                            .marker_state
+                            .store(MarkerState::Empty as u8, Ordering::SeqCst);
 
                         break 'insert_retry;
                     }
@@ -199,8 +211,14 @@ where
 
                 // Update version and reset marker to Empty
                 let next_version = empty_cell.cache_version + 1;
-                empty_cell.inner.version.store(next_version, Ordering::SeqCst);
-                empty_cell.inner.marker_state.store(MarkerState::Empty as u8, Ordering::SeqCst);
+                empty_cell
+                    .inner
+                    .version
+                    .store(next_version, Ordering::SeqCst);
+                empty_cell
+                    .inner
+                    .marker_state
+                    .store(MarkerState::Empty as u8, Ordering::SeqCst);
 
                 break 'insert_retry;
             }
@@ -437,6 +455,12 @@ where
                 // so offset_from is well-defined
                 let dest_index = unsafe { dest_ptr.offset_from(self.data.active_range.start) };
 
+                // Store the destination index BEFORE setting the Move marker.
+                // This ensures readers who see the Move state will always find a valid
+                // move_dest value. If the CAS fails, the stale move_dest is harmless
+                // since the marker state won't indicate Move.
+                cell_to_move.move_dest.store(dest_index, Ordering::SeqCst);
+
                 // Try to set Move marker via CAS
                 let cas_result = cell_to_move.compare_exchange_marker_state(
                     MarkerState::Empty,
@@ -451,9 +475,6 @@ where
                     continue 'retry;
                 }
 
-                // Store the destination index
-                cell_to_move.move_dest.store(dest_index, Ordering::SeqCst);
-
                 // SAFETY: We successfully set Move marker on cell_to_move via CAS,
                 // claiming write intent. No other thread will attempt to modify
                 // cell_to_move's key/value while Move marker is present.
@@ -466,7 +487,8 @@ where
                     // Set version on destination cell to match source version
                     cell.version.store(version, Ordering::SeqCst);
                     // Set marker on destination cell to indicate it's now filled with data
-                    cell.marker_state.store(MarkerState::Empty as u8, Ordering::SeqCst);
+                    cell.marker_state
+                        .store(MarkerState::Empty as u8, Ordering::SeqCst);
 
                     // update old cell
                     cell_to_move.key.get().write(None);
