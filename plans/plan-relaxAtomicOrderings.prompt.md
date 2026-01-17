@@ -33,7 +33,7 @@ This pattern only requires **pairwise synchronization** between a writer and its
 
    **Synchronizes with**: Any reader's Acquire load on `version` or `marker_state`.
 
-3. [ ] **Relax CAS operations to AcqRel/Acquire** in both files: Change `compare_exchange` and `compare_exchange_weak` success ordering from `SeqCst` → `AcqRel`, failure ordering from `SeqCst` → `Acquire` for `compare_exchange_marker_state` calls.
+3. [x] **Relax CAS operations to AcqRel/Acquire** in both files: Change `compare_exchange` and `compare_exchange_weak` success ordering from `SeqCst` → `AcqRel`, failure ordering from `SeqCst` → `Acquire` for `compare_exchange_marker_state` calls.
 
    **Rationale**:
 

@@ -426,8 +426,8 @@ impl<K: Clone, V: Clone> CellGuard<'_, K, V> {
         let result = self.inner.compare_exchange_marker_state(
             self.cache_marker_state,
             new_state,
-            AtomicOrdering::SeqCst,
-            AtomicOrdering::SeqCst,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
         );
 
         if result.is_err() {

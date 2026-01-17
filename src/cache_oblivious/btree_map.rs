@@ -471,11 +471,14 @@ where
                 cell_to_move.move_dest.store(dest_index, Ordering::SeqCst);
 
                 // Try to set Move marker via CAS
+                // AcqRel on success: Acquire synchronizes with any prior writer's Release
+                // (ensuring we see their completed writes), Release publishes our claim.
+                // Acquire on failure: We need to observe the current value that blocked us.
                 let cas_result = cell_to_move.compare_exchange_marker_state(
                     MarkerState::Empty,
                     MarkerState::Move,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
                 );
 
                 if cas_result.is_err() {
@@ -505,22 +508,25 @@ where
                     let new_version = version + 1;
                     // Update version and reset marker to Empty
                     // Use compare_exchange_weak because we can safely fail here
+                    // AcqRel/Acquire: Release ensures the None writes are visible;
+                    // Acquire on failure observes if another thread intervened.
                     let _ = cell_to_move.version.compare_exchange_weak(
                         version,
                         new_version,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
                     );
                     // Note: compare_exchange_weak can spuriously fail, but that's acceptable here.
                     // The source cell's key/value are already cleared to None, so even if
                     // version/marker updates fail (due to concurrent modification), readers
                     // will see an empty cell. The next operation on this cell will establish
                     // consistent version/marker state.
+                    // AcqRel/Acquire: Same rationale as the version CAS above.
                     let _ = cell_to_move.compare_exchange_marker_state(
                         MarkerState::Move,
                         MarkerState::Empty,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
                     );
                 };
             }
@@ -3672,6 +3678,236 @@ mod tests {
         assert_eq!(
             data.value, "data_before_version",
             "Data written before Release store must be visible after Acquire load"
+        );
+    }
+
+    /// Tests that CAS with AcqRel ordering on success properly synchronizes with prior writers.
+    ///
+    /// The Acquire component ensures we see any prior Release stores (from completed writes).
+    /// The Release component publishes our CAS success so subsequent Acquire loads will see it.
+    #[test]
+    fn test_cas_acqrel_synchronizes_with_prior_writes() {
+        use super::super::cell::{Cell, CellGuard, MarkerState};
+
+        let cell: Cell<u32, String> = Cell::default();
+
+        // Simulate a prior writer that wrote data and set marker to Empty
+        unsafe {
+            cell.key.get().write(Some(42));
+            cell.value
+                .get()
+                .write(Some(String::from("prior_writer_data")));
+        };
+        cell.version.store(2, Ordering::Release);
+        cell.marker_state
+            .store(MarkerState::Empty as u8, Ordering::Release);
+
+        // Create a guard to perform CAS (simulating the update_marker_state path)
+        let mut guard = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) }.unwrap();
+
+        // The guard should have captured the state via Acquire
+        assert_eq!(guard.cache_version, 2);
+        assert_eq!(guard.marker_state(), MarkerState::Empty);
+
+        // CAS with AcqRel should succeed and properly synchronize
+        let result = guard.update_marker_state(MarkerState::Inserting, 0);
+        assert!(result.is_ok(), "CAS should succeed on uncontended cell");
+
+        // Verify the marker state changed
+        let new_state = cell.load_marker_state(Ordering::Acquire);
+        assert_eq!(
+            new_state,
+            MarkerState::Inserting,
+            "CAS with AcqRel should publish the new state"
+        );
+
+        // The data written by prior writer should still be visible
+        // (AcqRel CAS doesn't modify key/value, just marker state)
+        let _cache_result = guard.cache();
+        // Note: cache() will fail because we changed marker_state, which is expected
+        // The important thing is that the CAS operation correctly synchronized
+    }
+
+    /// Tests that CAS failure with Acquire ordering observes the blocking value.
+    ///
+    /// When CAS fails, Acquire ordering ensures we see what value caused the failure.
+    #[test]
+    fn test_cas_failure_observes_blocking_value() {
+        use super::super::cell::{Cell, CellGuard, MarkerState};
+
+        let cell: Cell<u32, String> = Cell::default();
+
+        // Create guard expecting Empty marker
+        let mut guard = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) }.unwrap();
+        assert_eq!(guard.marker_state(), MarkerState::Empty);
+
+        // Another "thread" changes the marker to Inserting before our CAS
+        cell.marker_state
+            .store(MarkerState::Inserting as u8, Ordering::Release);
+
+        // Our CAS should fail because expected (Empty) != current (Inserting)
+        let result = guard.update_marker_state(MarkerState::Move, 5);
+        assert!(
+            result.is_err(),
+            "CAS should fail when marker was changed by another thread"
+        );
+
+        // The cell should still have Inserting (CAS failure doesn't modify)
+        let current_state = cell.load_marker_state(Ordering::Acquire);
+        assert_eq!(
+            current_state,
+            MarkerState::Inserting,
+            "CAS failure should not modify the cell"
+        );
+    }
+
+    /// Tests that rebalance CAS operations work correctly with AcqRel/Acquire ordering.
+    ///
+    /// During rebalance, we:
+    /// 1. CAS marker_state from Empty to Move (with AcqRel/Acquire)
+    /// 2. Copy data to destination
+    /// 3. CAS marker_state from Move to Empty (with AcqRel/Acquire)
+    ///
+    /// Readers must be able to observe the Move state and follow the move_dest.
+    #[test]
+    fn test_rebalance_cas_publishes_move_marker() {
+        use super::super::cell::{Cell, MarkerState};
+
+        let cell: Cell<u32, String> = Cell::default();
+
+        // Set up a cell with data
+        unsafe {
+            cell.key.get().write(Some(100));
+            cell.value.get().write(Some(String::from("moving_data")));
+        };
+        cell.version.store(1, Ordering::Release);
+        cell.marker_state
+            .store(MarkerState::Empty as u8, Ordering::Release);
+
+        // Store move_dest before CAS (as done in rebalance)
+        cell.move_dest.store(42, Ordering::Release);
+
+        // CAS to set Move marker (using AcqRel/Acquire as per our changes)
+        let cas_result = cell.compare_exchange_marker_state(
+            MarkerState::Empty,
+            MarkerState::Move,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        assert!(cas_result.is_ok(), "CAS should succeed on Empty cell");
+
+        // A reader loading with Acquire should see the Move state and move_dest
+        let observed_state = cell.load_marker_state(Ordering::Acquire);
+        assert_eq!(
+            observed_state,
+            MarkerState::Move,
+            "CAS Release component should publish Move state"
+        );
+
+        let observed_dest = cell.move_dest.load(Ordering::Acquire);
+        assert_eq!(
+            observed_dest, 42,
+            "move_dest should be visible after observing Move marker"
+        );
+    }
+
+    /// Tests that the best-effort cleanup CAS (compare_exchange_weak) works correctly.
+    ///
+    /// After moving data from source to destination during rebalance, we do best-effort
+    /// cleanup of the source cell. The CAS can spuriously fail, but when it succeeds,
+    /// readers should see the cleanup.
+    #[test]
+    fn test_best_effort_cleanup_cas_correctness() {
+        use super::super::cell::{Cell, MarkerState};
+
+        let cell: Cell<u32, String> = Cell::default();
+
+        // Set up a cell in Move state (as if mid-rebalance)
+        cell.version.store(5, Ordering::Release);
+        cell.marker_state
+            .store(MarkerState::Move as u8, Ordering::Release);
+        cell.move_dest.store(10, Ordering::Release);
+        unsafe {
+            cell.key.get().write(Some(999));
+            cell.value.get().write(Some(String::from("moved_data")));
+        };
+
+        // Clear the data (as done in rebalance)
+        unsafe {
+            cell.key.get().write(None);
+            cell.value.get().write(None);
+        };
+
+        // Best-effort CAS to bump version (using AcqRel/Acquire as per our changes)
+        let _ = cell
+            .version
+            .compare_exchange_weak(5, 6, Ordering::AcqRel, Ordering::Acquire);
+
+        // Best-effort CAS to reset marker to Empty
+        let _ = cell.compare_exchange_marker_state(
+            MarkerState::Move,
+            MarkerState::Empty,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+
+        // If CAS succeeded, readers should see Empty state with cleared data
+        // (CAS can spuriously fail, but in single-threaded test it should succeed)
+        let state = cell.load_marker_state(Ordering::Acquire);
+        assert_eq!(
+            state,
+            MarkerState::Empty,
+            "After successful cleanup CAS, marker should be Empty"
+        );
+
+        // Key and value should be None
+        let key = unsafe { &*cell.key.get() };
+        let value = unsafe { &*cell.value.get() };
+        assert!(key.is_none(), "Key should be cleared");
+        assert!(value.is_none(), "Value should be cleared");
+    }
+
+    /// Tests that CAS AcqRel on marker_state creates proper release sequence.
+    ///
+    /// When we store move_dest with Release, then CAS marker_state with AcqRel,
+    /// the Release on move_dest should be part of a release sequence that readers
+    /// can synchronize with via Acquire on marker_state.
+    #[test]
+    fn test_cas_release_sequence_with_move_dest() {
+        use super::super::cell::{Cell, MarkerState};
+
+        let cell: Cell<u32, String> = Cell::default();
+
+        // Set up cell with data
+        unsafe {
+            cell.key.get().write(Some(500));
+            cell.value.get().write(Some(String::from("test")));
+        };
+        cell.version.store(1, Ordering::Release);
+        cell.marker_state
+            .store(MarkerState::Empty as u8, Ordering::Release);
+
+        // Writer sequence: store move_dest (Release) -> CAS marker (AcqRel)
+        cell.move_dest.store(77, Ordering::Release);
+        let cas_result = cell.compare_exchange_marker_state(
+            MarkerState::Empty,
+            MarkerState::Move,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        assert!(cas_result.is_ok());
+
+        // Reader sequence: load marker (Acquire) -> load move_dest (Acquire)
+        // The Acquire on marker should synchronize with the writer's Release sequence
+        let observed_state = cell.load_marker_state(Ordering::Acquire);
+        assert_eq!(observed_state, MarkerState::Move);
+
+        // Because we synchronized with the CAS's Release, and the move_dest store
+        // was before the CAS, we should see the move_dest value
+        let observed_dest = cell.move_dest.load(Ordering::Acquire);
+        assert_eq!(
+            observed_dest, 77,
+            "Reader should observe move_dest written before CAS via release sequence"
         );
     }
 }

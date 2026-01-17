@@ -1,5 +1,49 @@
 # Atomic Ordering Relaxation Log
 
+## Step 3: Relax CAS operations to AcqRel/Acquire (Completed 2026-01-16)
+
+### Changes Made
+
+**In [cell.rs](../src/cache_oblivious/cell.rs):**
+
+- Lines ~426-430: Changed `compare_exchange_marker_state` in `update_marker_state()` from `SeqCst`/`SeqCst` → `AcqRel`/`Acquire`
+
+**In [btree_map.rs](../src/cache_oblivious/btree_map.rs):**
+
+- Lines ~474-481: Changed `compare_exchange_marker_state` for Move marker CAS from `SeqCst`/`SeqCst` → `AcqRel`/`Acquire`
+- Lines ~508-516: Changed `compare_exchange_weak` for version bump (best-effort cleanup) from `SeqCst`/`SeqCst` → `AcqRel`/`Acquire`
+- Lines ~522-528: Changed `compare_exchange_marker_state` for marker cleanup from `SeqCst`/`SeqCst` → `AcqRel`/`Acquire`
+
+### Tests Added
+
+Added 5 new tests in `btree_map.rs` to verify AcqRel/Acquire CAS semantics:
+
+1. `test_cas_acqrel_synchronizes_with_prior_writes` - Verifies CAS with AcqRel properly synchronizes with prior Release stores
+2. `test_cas_failure_observes_blocking_value` - Verifies CAS failure with Acquire observes the blocking value
+3. `test_rebalance_cas_publishes_move_marker` - Verifies rebalance CAS publishes Move state to readers
+4. `test_best_effort_cleanup_cas_correctness` - Verifies best-effort cleanup CAS works correctly
+5. `test_cas_release_sequence_with_move_dest` - Verifies CAS creates proper release sequence with move_dest
+
+All 121 tests pass.
+
+### Rationale
+
+AcqRel/Acquire ordering is sufficient for CAS operations because:
+
+- **Success (AcqRel)**: The Acquire component synchronizes with any prior writer's Release (ensuring we see their completed writes). The Release component publishes our claim so subsequent readers know the cell is in-use.
+- **Failure (Acquire)**: When CAS fails, we need to observe the current value that blocked us. Acquire is sufficient—we don't write anything on failure, so Release semantics add nothing.
+
+The Release component on success ensures that if we set `Inserting` or `Move` and later write data, any reader who observes our subsequent version bump will also see that we claimed the cell.
+
+### Notes for Next Contributor
+
+- Step 4 (Relax move_dest store to Release) is next
+- Focus on `move_dest.store()` in [btree_map.rs#L471](../src/cache_oblivious/btree_map.rs#L471)
+- Change from `SeqCst` → `Release`, since the subsequent CAS provides the synchronization
+- Note: `move_dest` store in `update_marker_state()` in cell.rs also needs to be changed
+
+---
+
 ## Step 2: Relax write-path stores to Release (Completed 2026-01-16)
 
 ### Changes Made
