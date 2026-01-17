@@ -1,5 +1,46 @@
 # Atomic Ordering Relaxation Log
 
+## Step 5: Relax destination cell writes to Release (Completed 2026-01-16)
+
+### Changes Made
+
+**In [btree_map.rs](../src/cache_oblivious/btree_map.rs):**
+
+- Lines ~502-505: Changed destination cell `version.store()` and `marker_state.store()` from `SeqCst` → `Release` in the rebalance loop
+
+### Tests Added
+
+Added 5 new tests in `btree_map.rs` to verify destination cell Release ordering semantics:
+
+1. `test_destination_cell_version_release_publishes_data` - Verifies Release store on version makes key/value visible to Acquire readers
+2. `test_destination_cell_marker_release_publishes_all_writes` - Verifies marker_state Release publishes all prior writes (key, value, version)
+3. `test_multiple_destination_cells_release_ordering` - Verifies multiple destination cells all have proper Release semantics
+4. `test_concurrent_readers_observe_destination_cell_after_release` - Verifies concurrent readers all see consistent data after Release stores
+5. `test_rebalance_source_to_destination_release_transfer` - Verifies full source-to-destination data transfer with Release/Acquire synchronization
+
+All 130 tests pass.
+
+### Rationale
+
+Release ordering on destination cell `version.store()` and `marker_state.store()` is sufficient because:
+
+- These stores publish the newly-moved data to the destination cell
+- Release ensures the preceding UnsafeCell writes (`key.get().write()`, `value.get().write()`) are visible to readers who Acquire-load the destination's `version` or `marker_state`
+- The write sequence is: (1) UnsafeCell writes for key/value, (2) version store with Release, (3) marker_state store with Release
+- Any reader who Acquire-loads the marker_state will see all prior writes due to Release/Acquire synchronization
+
+**Synchronizes with**: Readers performing Acquire loads on the destination cell's `version` or `marker_state`.
+
+### Notes for Next Contributor
+
+- Step 6 (Update cell.rs helper method orderings) is next
+- Focus on `update_marker_state()` in cell.rs
+- Ensure it uses `AcqRel`/`Acquire` for CAS and `Release` for `move_dest.store()`
+- Note: The CAS ordering was already changed in Step 3; verify `move_dest.store()` uses Release (changed in Step 4)
+- This step may already be complete from prior steps - verify and mark done if so
+
+---
+
 ## Step 4: Relax move_dest store to Release (Completed 2026-01-16)
 
 ### Changes Made

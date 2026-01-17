@@ -52,7 +52,7 @@ This pattern only requires **pairwise synchronization** between a writer and its
 
    **Reader-side correctness**: In `from_raw`, the reader loads `marker_state` (Acquire) before `move_dest` (Acquire). This order is critical—if the reader sees `Move`, the Acquire on `marker_state` synchronizes with the writer's Release, ensuring the subsequent `move_dest` load sees the stored value. The loads cannot be reordered because each Acquire prevents subsequent operations from moving before it.
 
-5. [ ] **Relax destination cell writes to Release** in rebalance (lines ~407-410): Change destination `version.store()` and `marker_state.store()` from `SeqCst` → `Release`.
+5. [x] **Relax destination cell writes to Release** in rebalance (lines ~407-410): Change destination `version.store()` and `marker_state.store()` from `SeqCst` → `Release`.
 
    **Rationale**: These stores publish the newly-moved data to the destination cell. Release ensures the preceding UnsafeCell writes (`key.get().write()`, `value.get().write()`) are visible to readers who Acquire-load the destination's `version` or `marker_state`.
 

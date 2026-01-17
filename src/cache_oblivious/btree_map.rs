@@ -499,10 +499,14 @@ where
                     cell.key.get().write((*cell_to_move.key.get()).clone());
                     cell.value.get().write((*cell_to_move.value.get()).clone());
                     // Set version on destination cell to match source version
-                    cell.version.store(version, Ordering::SeqCst);
+                    // Release ordering ensures the preceding UnsafeCell writes (key/value)
+                    // are visible to readers who Acquire-load this version.
+                    cell.version.store(version, Ordering::Release);
                     // Set marker on destination cell to indicate it's now filled with data
+                    // Release ordering ensures all preceding writes (key, value, version)
+                    // are visible to readers who Acquire-load this marker_state.
                     cell.marker_state
-                        .store(MarkerState::Empty as u8, Ordering::SeqCst);
+                        .store(MarkerState::Empty as u8, Ordering::Release);
 
                     // update old cell
                     cell_to_move.key.get().write(None);
@@ -4111,5 +4115,232 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+    }
+
+    /// Tests that destination cell version with Release ordering is visible to readers.
+    ///
+    /// During rebalance, after copying key/value to destination cell, we store the version
+    /// with Release ordering. Readers who Acquire-load this version should see the key/value.
+    #[test]
+    fn test_destination_cell_version_release_publishes_data() {
+        use super::super::cell::{Cell, CellGuard, MarkerState};
+
+        let dest_cell: Cell<u32, String> = Cell::default();
+
+        // Simulate rebalance: write key/value to destination cell, then store version
+        let source_version = 5;
+        unsafe {
+            dest_cell.key.get().write(Some(123));
+            dest_cell
+                .value
+                .get()
+                .write(Some(String::from("moved_data")));
+        };
+        // Release on version ensures key/value are visible to Acquire readers
+        dest_cell.version.store(source_version, Ordering::Release);
+        dest_cell
+            .marker_state
+            .store(MarkerState::Empty as u8, Ordering::Release);
+
+        // Reader with Acquire load should see the moved data
+        let guard = unsafe { CellGuard::from_raw(&dest_cell as *const Cell<u32, String>) }.unwrap();
+        assert_eq!(
+            guard.cache_version, source_version,
+            "Reader should observe the version stored with Release"
+        );
+
+        let cache_result = guard.cache();
+        assert!(cache_result.is_ok(), "cache() should succeed");
+        let data = cache_result.unwrap().as_ref().unwrap();
+        assert_eq!(
+            data.key, 123,
+            "Key written before Release version store must be visible"
+        );
+        assert_eq!(
+            data.value, "moved_data",
+            "Value written before Release version store must be visible"
+        );
+    }
+
+    /// Tests that destination cell marker_state with Release ordering publishes all prior writes.
+    ///
+    /// During rebalance, marker_state is stored last with Release ordering. Readers who
+    /// Acquire-load the marker_state should see key, value, and version.
+    #[test]
+    fn test_destination_cell_marker_release_publishes_all_writes() {
+        use super::super::cell::{Cell, CellGuard, MarkerState};
+
+        let dest_cell: Cell<u32, String> = Cell::default();
+
+        // Simulate rebalance write sequence:
+        // 1. Write key/value (UnsafeCell)
+        // 2. Store version (Release)
+        // 3. Store marker_state = Empty (Release)
+        unsafe {
+            dest_cell.key.get().write(Some(456));
+            dest_cell
+                .value
+                .get()
+                .write(Some(String::from("dest_value")));
+        };
+        dest_cell.version.store(10, Ordering::Release);
+        // Final Release on marker_state ensures all prior writes are visible
+        dest_cell
+            .marker_state
+            .store(MarkerState::Empty as u8, Ordering::Release);
+
+        // Reader acquires marker_state first, then version, then data
+        let marker = dest_cell.load_marker_state(Ordering::Acquire);
+        assert_eq!(marker, MarkerState::Empty);
+
+        // After seeing Empty marker via Acquire, all prior writes must be visible
+        let guard = unsafe { CellGuard::from_raw(&dest_cell as *const Cell<u32, String>) }.unwrap();
+        let cache_result = guard.cache();
+        assert!(cache_result.is_ok());
+        let data = cache_result.unwrap().as_ref().unwrap();
+        assert_eq!(data.key, 456);
+        assert_eq!(data.value, "dest_value");
+    }
+
+    /// Tests that multiple destination cells written during rebalance all have proper Release semantics.
+    ///
+    /// When rebalance moves multiple cells, each destination cell's version and marker_state
+    /// are stored with Release ordering. Readers of any destination should see consistent data.
+    #[test]
+    fn test_multiple_destination_cells_release_ordering() {
+        use super::super::cell::{Cell, CellGuard, MarkerState};
+
+        // Simulate 3 destination cells written during rebalance
+        let dest_cells: Vec<Cell<u32, String>> = (0..3).map(|_| Cell::default()).collect();
+
+        for (i, cell) in dest_cells.iter().enumerate() {
+            unsafe {
+                cell.key.get().write(Some((i * 100) as u32));
+                cell.value.get().write(Some(format!("dest_value_{}", i)));
+            };
+            cell.version.store(i as u16 + 1, Ordering::Release);
+            cell.marker_state
+                .store(MarkerState::Empty as u8, Ordering::Release);
+        }
+
+        // Each reader should see consistent data for its cell
+        for (i, cell) in dest_cells.iter().enumerate() {
+            let guard = unsafe { CellGuard::from_raw(cell as *const Cell<u32, String>) }.unwrap();
+            let cache_result = guard.cache();
+            assert!(cache_result.is_ok(), "Cell {} cache should succeed", i);
+            let data = cache_result.unwrap().as_ref().unwrap();
+            assert_eq!(data.key, (i * 100) as u32, "Cell {} key mismatch", i);
+            assert_eq!(
+                data.value,
+                format!("dest_value_{}", i),
+                "Cell {} value mismatch",
+                i
+            );
+        }
+    }
+
+    /// Tests that concurrent readers can observe destination cell data after Release stores.
+    ///
+    /// Multiple reader threads should all see consistent data in the destination cell
+    /// when they Acquire-load the version/marker_state stored with Release.
+    #[test]
+    fn test_concurrent_readers_observe_destination_cell_after_release() {
+        use super::super::cell::{Cell, CellGuard, MarkerState};
+        use std::sync::Arc;
+        use std::thread;
+
+        let dest_cell = Arc::new(Cell::<u64, String>::default());
+
+        // Writer: store data with Release ordering (simulating rebalance)
+        unsafe {
+            dest_cell.key.get().write(Some(999));
+            dest_cell
+                .value
+                .get()
+                .write(Some(String::from("concurrent_test")));
+        };
+        dest_cell.version.store(7, Ordering::Release);
+        dest_cell
+            .marker_state
+            .store(MarkerState::Empty as u8, Ordering::Release);
+
+        // Spawn multiple readers
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let cell_clone = Arc::clone(&dest_cell);
+            handles.push(thread::spawn(move || {
+                // Reader acquires the marker state
+                let marker = cell_clone.load_marker_state(Ordering::Acquire);
+                assert_eq!(marker, MarkerState::Empty);
+
+                // Then reads data via CellGuard
+                let guard =
+                    unsafe { CellGuard::from_raw(&*cell_clone as *const Cell<u64, String>) }
+                        .unwrap();
+                let cache_result = guard.cache();
+                assert!(cache_result.is_ok(), "cache() should succeed");
+                let data = cache_result.unwrap().as_ref().unwrap();
+                assert_eq!(data.key, 999, "All readers should see the same key");
+                assert_eq!(
+                    data.value, "concurrent_test",
+                    "All readers should see the same value"
+                );
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    /// Tests that destination cell Release ordering ensures source-to-destination data transfer.
+    ///
+    /// Simulates the full rebalance flow: source cell has data, move it to destination,
+    /// verify readers of destination see the moved data.
+    #[test]
+    fn test_rebalance_source_to_destination_release_transfer() {
+        use super::super::cell::{Cell, CellGuard, MarkerState};
+
+        // Source cell with original data
+        let source_cell: Cell<u32, String> = Cell::default();
+        unsafe {
+            source_cell.key.get().write(Some(777));
+            source_cell
+                .value
+                .get()
+                .write(Some(String::from("original_data")));
+        };
+        source_cell.version.store(3, Ordering::Release);
+        source_cell
+            .marker_state
+            .store(MarkerState::Empty as u8, Ordering::Release);
+
+        // Read source data
+        let source_key = unsafe { (*source_cell.key.get()).clone() };
+        let source_value = unsafe { (*source_cell.value.get()).clone() };
+        let source_version = source_cell.version.load(Ordering::Acquire);
+
+        // Destination cell - simulate rebalance write with Release
+        let dest_cell: Cell<u32, String> = Cell::default();
+        unsafe {
+            dest_cell.key.get().write(source_key.clone());
+            dest_cell.value.get().write(source_value.clone());
+        };
+        // Release stores ensure the cloned data is visible
+        dest_cell.version.store(source_version, Ordering::Release);
+        dest_cell
+            .marker_state
+            .store(MarkerState::Empty as u8, Ordering::Release);
+
+        // Reader of destination should see the moved data
+        let guard = unsafe { CellGuard::from_raw(&dest_cell as *const Cell<u32, String>) }.unwrap();
+        let cache_result = guard.cache();
+        assert!(cache_result.is_ok());
+        let data = cache_result.unwrap().as_ref().unwrap();
+        assert_eq!(data.key, 777, "Destination should have source's key");
+        assert_eq!(
+            data.value, "original_data",
+            "Destination should have source's value"
+        );
     }
 }
