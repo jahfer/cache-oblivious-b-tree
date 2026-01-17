@@ -519,8 +519,10 @@ impl<'a, K: Clone, V: Clone> CellGuard<'a, K, V> {
         // Acquire ordering synchronizes with writers' Release stores, ensuring we see
         // any data written before the version was updated.
         let version = cell.version.load(AtomicOrdering::Acquire);
-        // SAFETY: Caller guarantees cell is valid, so its key UnsafeCell is valid
-        let key = (*cell.key.get()).clone();
+        // SAFETY: Caller guarantees cell is valid, so its key UnsafeCell is valid.
+        // We only check is_some() here to avoid expensive cloning on every iteration.
+        // The actual key/value cloning is deferred to cache() when the data is needed.
+        let is_filled = (*cell.key.get()).is_some();
         let marker_state = cell.load_marker_state(AtomicOrdering::Acquire);
         let move_dest = cell.move_dest.load(AtomicOrdering::Acquire);
 
@@ -531,7 +533,7 @@ impl<'a, K: Clone, V: Clone> CellGuard<'a, K, V> {
 
         Ok(CellGuard {
             inner: cell,
-            is_filled: key.is_some(),
+            is_filled,
             cache_version: version,
             cache_marker_state: marker_state,
             cache_move_dest: move_dest,
@@ -886,5 +888,60 @@ mod tests {
         let second_data = second_result.unwrap().as_ref().unwrap();
         assert_eq!(first_data.key, second_data.key);
         assert_eq!(first_data.value, second_data.value);
+    }
+
+    /// Tests that from_raw only checks is_some() and defers cloning to cache().
+    /// This optimization avoids expensive key cloning during iteration when
+    /// only checking if cells are empty.
+    #[test]
+    fn test_from_raw_defers_key_cloning_to_cache() {
+        let cell: Cell<String, String> = Cell::default();
+
+        // Set up cell with a large key that would be expensive to clone
+        let large_key = "x".repeat(10000);
+        let large_value = "y".repeat(10000);
+        unsafe {
+            cell.key.get().write(Some(large_key.clone()));
+            cell.value.get().write(Some(large_value.clone()));
+        }
+
+        // from_raw should succeed and correctly detect the cell is filled
+        // WITHOUT cloning the key (just checking is_some())
+        let guard = unsafe { CellGuard::from_raw(&cell as *const Cell<String, String>) }.unwrap();
+
+        // is_filled should be true (detected via is_some(), not clone)
+        assert!(guard.is_filled);
+        assert!(!guard.is_empty());
+
+        // The actual cloning only happens when we call cache()
+        let cache_result = guard.cache();
+        assert!(cache_result.is_ok());
+        let data = cache_result.unwrap().as_ref().unwrap();
+        assert_eq!(data.key, large_key);
+        assert_eq!(data.value, large_value);
+    }
+
+    /// Tests that iteration over cells with is_empty() check doesn't clone keys.
+    /// This is the common hot path: iterating to find empty slots or specific keys.
+    #[test]
+    fn test_iteration_is_empty_check_is_cheap() {
+        let cell: Cell<String, String> = Cell::default();
+
+        // Empty cell
+        let guard = unsafe { CellGuard::from_raw(&cell as *const Cell<String, String>) }.unwrap();
+        assert!(guard.is_empty());
+
+        // Filled cell - is_empty() should work without cloning
+        unsafe {
+            cell.key.get().write(Some(String::from("key")));
+            cell.value.get().write(Some(String::from("value")));
+        }
+        cell.version.store(2, AtomicOrdering::Release);
+
+        let guard2 = unsafe { CellGuard::from_raw(&cell as *const Cell<String, String>) }.unwrap();
+        assert!(!guard2.is_empty());
+
+        // We can check is_empty() without ever calling cache()
+        // This is the optimization: no key cloning until cache() is called
     }
 }
