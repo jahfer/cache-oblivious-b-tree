@@ -27,7 +27,7 @@ This pattern only requires **pairwise synchronization** between a writer and its
 
    **Synchronizes with**: The writer's Release stores on `version` and `marker_state`.
 
-2. [ ] **Relax write-path stores to Release** in [btree_map.rs](src/cache_oblivious/btree_map.rs): Change `version.store()` and `marker_state.store()` calls after UnsafeCell writes from `SeqCst` → `Release` (lines ~130, ~135, ~149, ~153, ~179, ~183).
+2. [x] **Relax write-path stores to Release** in [btree_map.rs](src/cache_oblivious/btree_map.rs): Change `version.store()` and `marker_state.store()` calls after UnsafeCell writes from `SeqCst` → `Release` (lines ~130, ~135, ~149, ~153, ~179, ~183).
 
    **Rationale**: Release ordering ensures all preceding writes (including the UnsafeCell writes to `key` and `value`) are visible to any thread that subsequently performs an Acquire load on these atomics. This is the "publication" side of the pattern—once a reader sees the new version via Acquire, they're guaranteed to see the data that was written before the Release store.
 

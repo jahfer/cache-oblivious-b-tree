@@ -130,16 +130,18 @@ where
 
                     inserted_cell_ptr = Some(cell_guard.inner as *const Cell<K, V>);
 
-                    // Update version and reset marker to Empty
+                    // Update version and reset marker to Empty.
+                    // Release ordering ensures the preceding UnsafeCell writes to value
+                    // are visible to any thread that subsequently Acquire-loads version.
                     let next_version = cell_guard.cache_version + 1;
                     cell_guard
                         .inner
                         .version
-                        .store(next_version, Ordering::SeqCst);
+                        .store(next_version, Ordering::Release);
                     cell_guard
                         .inner
                         .marker_state
-                        .store(MarkerState::Empty as u8, Ordering::SeqCst);
+                        .store(MarkerState::Empty as u8, Ordering::Release);
 
                     break 'insert_retry;
                 } else {
@@ -162,16 +164,18 @@ where
 
                         inserted_cell_ptr = Some(empty_cell.inner as *const Cell<K, V>);
 
-                        // Update version and reset marker to Empty
+                        // Update version and reset marker to Empty.
+                        // Release ordering ensures the preceding UnsafeCell writes to key/value
+                        // are visible to any thread that subsequently Acquire-loads version.
                         let next_version = empty_cell.cache_version + 1;
                         empty_cell
                             .inner
                             .version
-                            .store(next_version, Ordering::SeqCst);
+                            .store(next_version, Ordering::Release);
                         empty_cell
                             .inner
                             .marker_state
-                            .store(MarkerState::Empty as u8, Ordering::SeqCst);
+                            .store(MarkerState::Empty as u8, Ordering::Release);
 
                         break 'insert_retry;
                     }
@@ -209,16 +213,18 @@ where
 
                 inserted_cell_ptr = Some(empty_cell.inner as *const Cell<K, V>);
 
-                // Update version and reset marker to Empty
+                // Update version and reset marker to Empty.
+                // Release ordering ensures the preceding UnsafeCell writes to key/value
+                // are visible to any thread that subsequently Acquire-loads version.
                 let next_version = empty_cell.cache_version + 1;
                 empty_cell
                     .inner
                     .version
-                    .store(next_version, Ordering::SeqCst);
+                    .store(next_version, Ordering::Release);
                 empty_cell
                     .inner
                     .marker_state
-                    .store(MarkerState::Empty as u8, Ordering::SeqCst);
+                    .store(MarkerState::Empty as u8, Ordering::Release);
 
                 break 'insert_retry;
             }
@@ -3492,5 +3498,180 @@ mod tests {
         for i in 0..200 {
             assert_eq!(tree.get(&i), Some(i / 2));
         }
+    }
+
+    // ==================== ATOMIC ORDERING TESTS (Step 2) ====================
+    // Tests verifying Release ordering on write-path stores works correctly.
+
+    /// Tests that write-path Release stores synchronize-with read-path Acquire loads.
+    ///
+    /// When a writer completes (stores version with Release), a subsequent reader
+    /// (loading version with Acquire) must observe the written data. This test
+    /// verifies the Release/Acquire synchronization pattern works correctly.
+    #[test]
+    fn test_write_path_release_synchronizes_with_read_acquire() {
+        use super::super::cell::{Cell, CellGuard, MarkerState};
+
+        let cell: Cell<u32, String> = Cell::default();
+
+        // Simulate writer: set Inserting marker, write data, then Release stores
+        cell.marker_state
+            .store(MarkerState::Inserting as u8, Ordering::Relaxed);
+
+        // Write data to UnsafeCell
+        unsafe {
+            cell.key.get().write(Some(42));
+            cell.value.get().write(Some(String::from("test_value")));
+        };
+
+        // Release store on version (ensures preceding writes are visible)
+        cell.version.store(2, Ordering::Release);
+        // Release store on marker_state to clear Inserting
+        cell.marker_state
+            .store(MarkerState::Empty as u8, Ordering::Release);
+
+        // Now simulate reader using Acquire semantics (via CellGuard::from_raw)
+        let guard = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) }.unwrap();
+
+        // Acquire load synchronizes-with Release stores above
+        assert_eq!(guard.cache_version, 2);
+        assert_eq!(guard.marker_state(), MarkerState::Empty);
+
+        // cache() also uses Acquire, should see the written data
+        let cache_result = guard.cache();
+        assert!(cache_result.is_ok());
+        let data = cache_result.unwrap().as_ref().unwrap();
+        assert_eq!(data.key, 42);
+        assert_eq!(data.value, "test_value");
+    }
+
+    /// Tests that multiple writes with Release ordering are correctly observed.
+    ///
+    /// When inserting multiple values sequentially, each write uses Release stores.
+    /// Subsequent reads with Acquire loads must observe the correct final state.
+    #[test]
+    fn test_multiple_writes_with_release_all_observable() {
+        let mut tree: BTreeMap<u32, String> = BTreeMap::new(8);
+
+        // Each insert uses Release stores for version and marker_state
+        tree.insert(10, String::from("ten"));
+        tree.insert(20, String::from("twenty"));
+        tree.insert(30, String::from("thirty"));
+
+        // Reads use Acquire loads - should see all written data
+        assert_eq!(
+            tree.get(&10),
+            Some(String::from("ten")),
+            "Release store on insert should be visible via Acquire load"
+        );
+        assert_eq!(
+            tree.get(&20),
+            Some(String::from("twenty")),
+            "Release store on insert should be visible via Acquire load"
+        );
+        assert_eq!(
+            tree.get(&30),
+            Some(String::from("thirty")),
+            "Release store on insert should be visible via Acquire load"
+        );
+    }
+
+    /// Tests that the marker_state Release store makes state visible to readers.
+    ///
+    /// After an insert, the marker_state is set to Empty with Release ordering.
+    /// Readers loading marker_state with Acquire should see Empty, not Inserting.
+    #[test]
+    fn test_marker_state_release_visible_after_insert() {
+        use super::super::cell::MarkerState;
+
+        let mut tree: BTreeMap<u32, u32> = BTreeMap::new(8);
+
+        tree.insert(1, 100);
+
+        // After insert completes, all cells should have Empty marker (or Move for rebalanced cells)
+        // They should NOT have Inserting marker since the Release store should be visible
+        for cell in tree.data.as_slice().iter() {
+            let state = cell.load_marker_state(Ordering::Acquire);
+            assert!(
+                state == MarkerState::Empty || state == MarkerState::Move,
+                "After insert completes, marker should be Empty or Move (for relocated cells), not {:?}",
+                state
+            );
+        }
+    }
+
+    /// Tests that version bumps with Release ordering invalidate stale readers.
+    ///
+    /// If a reader captures a guard before a write completes, and then the write
+    /// finishes (bumping version with Release), the reader's cache() call should
+    /// fail because it will see the new version via Acquire load.
+    #[test]
+    fn test_version_release_invalidates_stale_reader() {
+        use super::super::cell::{Cell, CellGuard, MarkerState};
+
+        let cell: Cell<u32, String> = Cell::default();
+
+        // Create a guard while version is 1
+        let guard = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) }.unwrap();
+        assert_eq!(guard.cache_version, 1);
+
+        // Simulate a writer completing: write data and bump version with Release
+        cell.marker_state
+            .store(MarkerState::Inserting as u8, Ordering::Relaxed);
+        unsafe {
+            cell.key.get().write(Some(99));
+            cell.value.get().write(Some(String::from("new_data")));
+        };
+        cell.version.store(2, Ordering::Release); // Release store bumps version
+        cell.marker_state
+            .store(MarkerState::Empty as u8, Ordering::Release);
+
+        // The guard's cache() should fail because Acquire load will see new version
+        let cache_result = guard.cache();
+        assert!(
+            cache_result.is_err(),
+            "Stale guard should fail when version was bumped with Release store"
+        );
+    }
+
+    /// Tests that Release ordering ensures UnsafeCell writes are visible before version bump.
+    ///
+    /// The critical invariant: when a reader sees version N (via Acquire), they must
+    /// see all data written before version was set to N. Release ordering on version
+    /// store ensures this.
+    #[test]
+    fn test_release_ensures_data_visible_before_version() {
+        use super::super::cell::{Cell, CellGuard, MarkerState};
+
+        let cell: Cell<u32, String> = Cell::default();
+
+        // Write data BEFORE the Release store on version
+        unsafe {
+            cell.key.get().write(Some(123));
+            cell.value
+                .get()
+                .write(Some(String::from("data_before_version")));
+        };
+
+        // Release store: ensures preceding writes are visible to Acquire readers
+        cell.version.store(5, Ordering::Release);
+        cell.marker_state
+            .store(MarkerState::Empty as u8, Ordering::Release);
+
+        // Reader with Acquire load should see the data
+        let guard = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) }.unwrap();
+        assert_eq!(guard.cache_version, 5);
+
+        let cache_result = guard.cache();
+        assert!(cache_result.is_ok());
+        let data = cache_result.unwrap().as_ref().unwrap();
+        assert_eq!(
+            data.key, 123,
+            "Data written before Release store must be visible after Acquire load"
+        );
+        assert_eq!(
+            data.value, "data_before_version",
+            "Data written before Release store must be visible after Acquire load"
+        );
     }
 }

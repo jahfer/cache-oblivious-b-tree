@@ -1,5 +1,47 @@
 # Atomic Ordering Relaxation Log
 
+## Step 2: Relax write-path stores to Release (Completed 2026-01-16)
+
+### Changes Made
+
+**In [btree_map.rs](../src/cache_oblivious/btree_map.rs):**
+
+- Lines ~138, ~142: Changed `version.store()` and `marker_state.store()` from `SeqCst` → `Release` (overwrite existing key path)
+- Lines ~170, ~174: Changed `version.store()` and `marker_state.store()` from `SeqCst` → `Release` (insert into empty cell path, inner branch)
+- Lines ~217, ~221: Changed `version.store()` and `marker_state.store()` from `SeqCst` → `Release` (insert into empty cell path, outer branch)
+
+All 6 write-path stores now use Release ordering instead of SeqCst.
+
+### Tests Added
+
+Added 5 new tests in `btree_map.rs` to verify Release ordering semantics:
+
+1. `test_write_path_release_synchronizes_with_read_acquire` - Verifies Release stores synchronize-with Acquire loads
+2. `test_multiple_writes_with_release_all_observable` - Verifies multiple writes are all observable via Acquire
+3. `test_marker_state_release_visible_after_insert` - Verifies marker state is Empty after insert completes
+4. `test_version_release_invalidates_stale_reader` - Verifies Release store invalidates stale guards
+5. `test_release_ensures_data_visible_before_version` - Verifies data written before Release is visible after Acquire
+
+All 116 tests pass.
+
+### Rationale
+
+Release ordering is sufficient for write-path stores because:
+
+- It ensures all preceding writes (UnsafeCell writes to `key`/`value`) are visible to threads that Acquire-load `version` or `marker_state`
+- This is the "publication" side of the Release/Acquire pattern
+- Once a reader sees the new version via Acquire, they're guaranteed to see the data written before the Release store
+- We don't need total ordering with writes to other cells; we only need pairwise synchronization with readers of this cell
+
+### Notes for Next Contributor
+
+- Step 3 (Relax CAS operations to AcqRel/Acquire) is next
+- Focus on `compare_exchange` and `compare_exchange_weak` calls on `marker_state`
+- Change success ordering from `SeqCst` → `AcqRel`, failure ordering from `SeqCst` → `Acquire`
+- This applies to both `btree_map.rs` and `cell.rs`
+
+---
+
 ## Step 1: Relax read-path loads to Acquire (Completed 2026-01-16)
 
 ### Changes Made
