@@ -514,6 +514,8 @@ impl<'a, K: Clone, V: Clone> CellGuard<'a, K, V> {
     /// The caller must ensure that:
     /// - `ptr` points to a valid, properly aligned `Cell<K, V>`
     /// - The `Cell` will remain valid for the lifetime `'a`
+    ///
+    /// EXTREMELY HOT PATH!
     #[must_use = "this returns a Result that should be checked for errors"]
     pub unsafe fn from_raw(ptr: *const Cell<K, V>) -> Result<CellGuard<'a, K, V>, Box<dyn Error>> {
         // SAFETY: Caller guarantees ptr is valid and properly aligned
