@@ -42,7 +42,7 @@ This pattern only requires **pairwise synchronization** between a writer and its
 
    **Why not just Acquire on success?** We need Release to ensure that if we set `Inserting` and later write data, any reader who observes our subsequent version bump will also see that we claimed the cell (in case they retry).
 
-4. [ ] **Relax move_dest store to Release** in [btree_map.rs#L381](src/cache_oblivious/btree_map.rs#L381): Change `move_dest.store()` before the Move CAS from `SeqCst` → `Release`, since the subsequent CAS provides the synchronization.
+4. [x] **Relax move_dest store to Release** in [btree_map.rs#L381](src/cache_oblivious/btree_map.rs#L381): Change `move_dest.store()` before the Move CAS from `SeqCst` → `Release`, since the subsequent CAS provides the synchronization.
 
    **Rationale**: The `move_dest` is stored _before_ the CAS that sets `marker_state` to `Move`. The CAS itself uses AcqRel, which provides the synchronization point. However, we use Release on the `move_dest` store to ensure the destination index is visible before any reader observes the Move marker. The CAS's Release component then "carries" this write forward.
 

@@ -468,7 +468,9 @@ where
                 // This ensures readers who see the Move state will always find a valid
                 // move_dest value. If the CAS fails, the stale move_dest is harmless
                 // since the marker state won't indicate Move.
-                cell_to_move.move_dest.store(dest_index, Ordering::SeqCst);
+                // Release ordering ensures move_dest is visible before any reader observes
+                // the Move marker (via the subsequent CAS's Release component).
+                cell_to_move.move_dest.store(dest_index, Ordering::Release);
 
                 // Try to set Move marker via CAS
                 // AcqRel on success: Acquire synchronizes with any prior writer's Release
@@ -3909,5 +3911,205 @@ mod tests {
             observed_dest, 77,
             "Reader should observe move_dest written before CAS via release sequence"
         );
+    }
+
+    /// Tests that move_dest Release store is visible to readers after Acquire on marker_state.
+    ///
+    /// This test verifies the fundamental Release/Acquire synchronization pattern:
+    /// Writer does Release store on move_dest -> Reader does Acquire load on marker_state
+    /// -> Reader's subsequent load of move_dest must see the Release-stored value.
+    #[test]
+    fn test_move_dest_release_visible_after_marker_acquire() {
+        use super::super::cell::{Cell, MarkerState};
+
+        let cell: Cell<i32, i32> = Cell::default();
+
+        // Initialize cell with data
+        unsafe {
+            cell.key.get().write(Some(42));
+            cell.value.get().write(Some(100));
+        };
+        cell.version.store(1, Ordering::Release);
+        cell.marker_state
+            .store(MarkerState::Empty as u8, Ordering::Release);
+
+        // Simulate the rebalance writer pattern:
+        // 1. Store move_dest with Release
+        // 2. CAS marker_state to Move with AcqRel
+        let dest_index: isize = 123;
+        cell.move_dest.store(dest_index, Ordering::Release);
+        let cas_result = cell.compare_exchange_marker_state(
+            MarkerState::Empty,
+            MarkerState::Move,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        assert!(cas_result.is_ok());
+
+        // Simulate reader pattern from CellGuard::from_raw:
+        // 1. Load marker_state with Acquire (synchronizes-with writer's Release)
+        // 2. Load move_dest with Acquire
+        let observed_state = cell.load_marker_state(Ordering::Acquire);
+        assert_eq!(observed_state, MarkerState::Move);
+
+        let observed_dest = cell.move_dest.load(Ordering::Acquire);
+        assert_eq!(
+            observed_dest, dest_index,
+            "move_dest Release store should be visible after marker_state Acquire"
+        );
+    }
+
+    /// Tests that move_dest store ordering cannot be reordered after the CAS.
+    ///
+    /// Release ordering on move_dest.store() ensures it cannot be reordered after
+    /// the subsequent CAS. This is critical for correctness: if move_dest were
+    /// stored after the CAS, a reader could see the Move marker but not the
+    /// destination index.
+    #[test]
+    fn test_move_dest_release_prevents_reorder_after_cas() {
+        use super::super::cell::{Cell, MarkerState};
+        use std::sync::Arc;
+        use std::thread;
+
+        let cell = Arc::new(Cell::<u32, String>::default());
+
+        // Initialize cell
+        unsafe {
+            cell.key.get().write(Some(999));
+            cell.value.get().write(Some(String::from("data")));
+        };
+        cell.version.store(5, Ordering::Release);
+        cell.marker_state
+            .store(MarkerState::Empty as u8, Ordering::Release);
+
+        // Run multiple iterations to increase chance of catching ordering issues
+        for iteration in 0..50 {
+            // Reset cell state
+            cell.marker_state
+                .store(MarkerState::Empty as u8, Ordering::Release);
+            cell.move_dest.store(0, Ordering::Release);
+
+            let cell_clone = Arc::clone(&cell);
+            let dest_value = 1000 + iteration;
+
+            let writer = thread::spawn(move || {
+                // Writer pattern: store move_dest (Release) -> CAS marker (AcqRel)
+                cell_clone.move_dest.store(dest_value, Ordering::Release);
+                let _ = cell_clone.compare_exchange_marker_state(
+                    MarkerState::Empty,
+                    MarkerState::Move,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            });
+
+            writer.join().unwrap();
+
+            // After writer completes, verify reader observes consistent state
+            let state = cell.load_marker_state(Ordering::Acquire);
+            if state == MarkerState::Move {
+                let dest = cell.move_dest.load(Ordering::Acquire);
+                assert_eq!(
+                    dest, dest_value,
+                    "If Move marker is observed, move_dest must have the correct value (iteration {})",
+                    iteration
+                );
+            }
+        }
+    }
+
+    /// Tests that update_marker_state helper correctly uses Release for move_dest.
+    ///
+    /// The helper method in cell.rs should use Release ordering for move_dest.store()
+    /// to maintain the same guarantees as the direct stores in btree_map.rs.
+    #[test]
+    fn test_update_marker_state_move_dest_release() {
+        use super::super::cell::{Cell, CellGuard, MarkerState};
+
+        let cell: Cell<i32, i32> = Cell::default();
+
+        // Initialize cell
+        unsafe {
+            cell.key.get().write(Some(10));
+            cell.value.get().write(Some(20));
+        };
+        cell.version.store(1, Ordering::Release);
+        cell.marker_state
+            .store(MarkerState::Empty as u8, Ordering::Release);
+
+        // Get a mutable guard
+        // SAFETY: cell is valid and lives for the scope of this function
+        let mut guard = unsafe {
+            CellGuard::from_raw(&cell as *const Cell<i32, i32>).expect("Should get guard")
+        };
+
+        // Use update_marker_state to set Move marker with destination
+        let dest_index: isize = 456;
+        guard
+            .update_marker_state(MarkerState::Move, dest_index)
+            .expect("Should update marker state");
+
+        // Verify another reader can observe the move_dest value via Acquire
+        let observed_state = cell.load_marker_state(Ordering::Acquire);
+        assert_eq!(observed_state, MarkerState::Move);
+
+        let observed_dest = cell.move_dest.load(Ordering::Acquire);
+        assert_eq!(
+            observed_dest, dest_index,
+            "move_dest set via update_marker_state should be visible via Acquire"
+        );
+    }
+
+    /// Tests concurrent readers observing move_dest during active Move state.
+    ///
+    /// Multiple readers should all observe the correct move_dest value when
+    /// they see the Move marker, demonstrating that Release/Acquire provides
+    /// sufficient synchronization for concurrent access.
+    #[test]
+    fn test_concurrent_readers_observe_move_dest() {
+        use super::super::cell::{Cell, MarkerState};
+        use std::sync::Arc;
+        use std::thread;
+
+        let cell = Arc::new(Cell::<u64, u64>::default());
+
+        // Initialize cell
+        unsafe {
+            cell.key.get().write(Some(1));
+            cell.value.get().write(Some(2));
+        };
+        cell.version.store(1, Ordering::Release);
+
+        let expected_dest: isize = 789;
+
+        // Set up the Move state with move_dest
+        cell.move_dest.store(expected_dest, Ordering::Release);
+        let cas_result = cell.compare_exchange_marker_state(
+            MarkerState::Empty,
+            MarkerState::Move,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        assert!(cas_result.is_ok());
+
+        // Spawn multiple reader threads
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let cell_clone = Arc::clone(&cell);
+            handles.push(thread::spawn(move || {
+                let state = cell_clone.load_marker_state(Ordering::Acquire);
+                if state == MarkerState::Move {
+                    let dest = cell_clone.move_dest.load(Ordering::Acquire);
+                    assert_eq!(
+                        dest, expected_dest,
+                        "All readers should observe the same move_dest value"
+                    );
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 }

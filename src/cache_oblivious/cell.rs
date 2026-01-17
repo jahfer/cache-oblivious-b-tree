@@ -417,10 +417,12 @@ impl<K: Clone, V: Clone> CellGuard<'_, K, V> {
         // This ensures readers who see the Move state will always find a valid
         // move_dest value - they may see a stale value if CAS fails, but that's
         // harmless since the marker state won't indicate Move.
+        // Release ordering ensures move_dest is visible before any reader observes
+        // the Move marker (via the subsequent CAS's Release component).
         if new_state == MarkerState::Move {
             self.inner
                 .move_dest
-                .store(new_move_dest, AtomicOrdering::SeqCst);
+                .store(new_move_dest, AtomicOrdering::Release);
         }
 
         let result = self.inner.compare_exchange_marker_state(

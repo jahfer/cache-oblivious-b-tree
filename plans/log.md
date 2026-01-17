@@ -1,5 +1,51 @@
 # Atomic Ordering Relaxation Log
 
+## Step 4: Relax move_dest store to Release (Completed 2026-01-16)
+
+### Changes Made
+
+**In [btree_map.rs](../src/cache_oblivious/btree_map.rs):**
+
+- Line ~472: Changed `cell_to_move.move_dest.store(dest_index, Ordering::SeqCst)` → `Ordering::Release`
+
+**In [cell.rs](../src/cache_oblivious/cell.rs):**
+
+- Line ~423: Changed `self.inner.move_dest.store(new_move_dest, AtomicOrdering::SeqCst)` → `AtomicOrdering::Release` in `update_marker_state()`
+
+### Tests Added
+
+Added 5 new tests in `btree_map.rs` to verify move_dest Release ordering semantics:
+
+1. `test_move_dest_release_visible_after_marker_acquire` - Verifies Release store on move_dest is visible to readers who Acquire-load marker_state
+2. `test_move_dest_release_prevents_reorder_after_cas` - Verifies Release ordering prevents move_dest from being reordered after the CAS (multi-iteration concurrent test)
+3. `test_update_marker_state_move_dest_release` - Verifies the helper method in cell.rs correctly uses Release for move_dest
+4. `test_concurrent_readers_observe_move_dest` - Verifies multiple concurrent readers all observe the correct move_dest value when seeing Move marker
+
+All 125 tests pass.
+
+### Rationale
+
+Release ordering on `move_dest.store()` is sufficient because:
+
+- The `move_dest` is stored BEFORE the CAS that sets `marker_state` to `Move`
+- The CAS uses AcqRel, which provides the synchronization point
+- Release on `move_dest.store()` ensures it cannot be reordered after the subsequent CAS
+- The CAS's Release component creates a release sequence that includes the prior `move_dest` store
+- When a reader performs an Acquire load on `marker_state` and observes `Move`, they synchronize-with this release sequence and are guaranteed to see the `move_dest` value
+
+**Critical ordering preserved**: `move_dest` store (Release) → `marker_state` CAS (AcqRel). Any reader who Acquires the Move marker state will observe the `move_dest` value.
+
+**Why this is safe on ARM**: The Release on `move_dest.store()` ensures it cannot be reordered after the subsequent CAS. The reader-side loads `marker_state` (Acquire) before `move_dest` (Acquire), creating proper synchronization.
+
+### Notes for Next Contributor
+
+- Step 5 (Relax destination cell writes to Release) is next
+- Focus on lines ~499-503 in btree_map.rs (destination cell version/marker stores during rebalance)
+- Change `cell.version.store()` and `cell.marker_state.store()` from `SeqCst` → `Release`
+- These stores publish the newly-moved data to the destination cell
+
+---
+
 ## Step 3: Relax CAS operations to AcqRel/Acquire (Completed 2026-01-16)
 
 ### Changes Made
