@@ -520,6 +520,12 @@ impl<'a, K: Clone, V: Clone> CellGuard<'a, K, V> {
         let marker_state = cell.load_marker_state(AtomicOrdering::SeqCst);
         let move_dest = cell.move_dest.load(AtomicOrdering::SeqCst);
 
+        let version_reread = cell.version.load(AtomicOrdering::SeqCst);
+
+        if version != version_reread {
+            return Err(Box::new(CellError::VersionMismatch));
+        }
+
         Ok(CellGuard {
             inner: cell,
             is_filled: key.is_some(),
