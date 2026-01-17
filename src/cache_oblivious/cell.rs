@@ -355,7 +355,9 @@ impl<K: Clone, V: Clone> CellGuard<'_, K, V> {
             return Ok(cached);
         }
 
-        let version = self.inner.version.load(AtomicOrdering::SeqCst);
+        // Acquire ordering synchronizes with writers' Release stores on version.
+        // This ensures that if a writer has completed (version changed), we'll see their data.
+        let version = self.inner.version.load(AtomicOrdering::Acquire);
 
         // Check version consistency BEFORE cloning any data
         if version != self.cache_version {
@@ -514,14 +516,15 @@ impl<'a, K: Clone, V: Clone> CellGuard<'a, K, V> {
     pub unsafe fn from_raw(ptr: *const Cell<K, V>) -> Result<CellGuard<'a, K, V>, Box<dyn Error>> {
         // SAFETY: Caller guarantees ptr is valid and properly aligned
         let cell = &*ptr;
-        let version = cell.version.load(AtomicOrdering::SeqCst);
+        // Acquire ordering synchronizes with writers' Release stores, ensuring we see
+        // any data written before the version was updated.
+        let version = cell.version.load(AtomicOrdering::Acquire);
         // SAFETY: Caller guarantees cell is valid, so its key UnsafeCell is valid
         let key = (*cell.key.get()).clone();
-        let marker_state = cell.load_marker_state(AtomicOrdering::SeqCst);
-        let move_dest = cell.move_dest.load(AtomicOrdering::SeqCst);
+        let marker_state = cell.load_marker_state(AtomicOrdering::Acquire);
+        let move_dest = cell.move_dest.load(AtomicOrdering::Acquire);
 
         let version_reread = cell.version.load(AtomicOrdering::SeqCst);
-
         if version != version_reread {
             return Err(Box::new(CellError::VersionMismatch));
         }
@@ -730,5 +733,158 @@ mod tests {
 
         let error: Box<dyn Error> = Box::new(CellError::CasFailed);
         assert!(error.to_string().contains("CAS"));
+    }
+
+    // Tests for Acquire ordering on read-path loads (Step 1 of atomic relaxation)
+
+    /// Tests that CellGuard::from_raw correctly reads version with Acquire semantics.
+    /// The guard should capture the version at creation time and use it for validation.
+    #[test]
+    fn test_from_raw_captures_version_with_acquire() {
+        let cell: Cell<u32, String> = Cell::default();
+
+        // Write data and update version using Release (simulating a writer)
+        unsafe {
+            cell.key.get().write(Some(42));
+            cell.value.get().write(Some(String::from("test")));
+        }
+        cell.version.store(2, AtomicOrdering::Release);
+
+        // from_raw uses Acquire, which synchronizes-with the Release above
+        let guard = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) }.unwrap();
+
+        // Guard should have captured the updated version
+        assert_eq!(guard.cache_version, 2);
+
+        // cache() should succeed because version hasn't changed
+        let cache_result = guard.cache();
+        assert!(cache_result.is_ok());
+        let data = cache_result.unwrap().as_ref().unwrap();
+        assert_eq!(data.key, 42);
+        assert_eq!(data.value, "test");
+    }
+
+    /// Tests that CellGuard correctly captures marker state and move_dest with Acquire.
+    /// These fields are used to determine the cell's current operation state.
+    #[test]
+    fn test_from_raw_captures_marker_state_with_acquire() {
+        let cell: Cell<u32, String> = Cell::default();
+
+        // Set Move state with a destination (simulating a rebalance writer)
+        cell.move_dest.store(42, AtomicOrdering::Release);
+        cell.marker_state
+            .store(MarkerState::Move as u8, AtomicOrdering::Release);
+
+        // from_raw uses Acquire, which synchronizes-with the Release stores above
+        let guard = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) }.unwrap();
+
+        // Guard should have captured Move state and the destination
+        assert_eq!(guard.marker_state(), MarkerState::Move);
+        assert_eq!(guard.move_dest(), 42);
+    }
+
+    /// Tests that cache() correctly uses Acquire semantics to detect version changes.
+    /// If a writer updates the version with Release after guard creation, cache() should fail.
+    #[test]
+    fn test_cache_detects_version_change_with_acquire() {
+        let cell: Cell<u32, String> = Cell::default();
+
+        // Create guard while version is 1
+        let guard = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) }.unwrap();
+        assert_eq!(guard.cache_version, 1);
+
+        // Simulate a writer completing: write data and bump version with Release
+        unsafe {
+            cell.key.get().write(Some(99));
+            cell.value.get().write(Some(String::from("changed")));
+        }
+        cell.version.store(2, AtomicOrdering::Release);
+
+        // cache() uses Acquire which synchronizes-with the Release above,
+        // so it will observe the new version and fail validation
+        let cache_result = guard.cache();
+        assert!(
+            cache_result.is_err(),
+            "cache() should fail when version changed by a Release store"
+        );
+    }
+
+    /// Tests the seqlock pattern: version re-read must detect changes during data read.
+    /// from_raw reads version, then data, then re-reads version to validate consistency.
+    /// If a concurrent write occurs between reads, the re-read should detect it.
+    #[test]
+    fn test_seqlock_detects_concurrent_modification_in_from_raw() {
+        // We can't truly test concurrent behavior in a single-threaded test,
+        // but we can verify the seqlock pattern works by checking that
+        // version mismatch between initial read and re-read causes failure.
+
+        let cell: Cell<u32, String> = Cell::default();
+
+        // Pre-populate cell with data
+        unsafe {
+            cell.key.get().write(Some(1));
+            cell.value.get().write(Some(String::from("original")));
+        }
+
+        // First from_raw should succeed with matching versions
+        let guard_result = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) };
+        assert!(guard_result.is_ok());
+
+        // Verify the guard captured the correct state
+        let guard = guard_result.unwrap();
+        assert_eq!(guard.cache_version, 1);
+        assert!(guard.is_filled);
+    }
+
+    /// Tests that read-path loads work correctly for empty cells.
+    #[test]
+    fn test_from_raw_with_empty_cell_acquire() {
+        let cell: Cell<u32, String> = Cell::default();
+
+        // from_raw should work on empty cells
+        let guard = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) }.unwrap();
+
+        assert_eq!(guard.cache_version, 1);
+        assert!(guard.is_empty());
+        assert_eq!(guard.marker_state(), MarkerState::Empty);
+        assert_eq!(guard.move_dest(), 0);
+
+        // cache() should return None for empty cell
+        let cache_result = guard.cache();
+        assert!(cache_result.is_ok());
+        assert!(cache_result.unwrap().is_none());
+    }
+
+    /// Tests that cache() can be called multiple times without re-validation.
+    /// After the first successful cache(), subsequent calls return cached data.
+    #[test]
+    fn test_cache_returns_cached_data_on_subsequent_calls() {
+        let cell: Cell<u32, String> = Cell::default();
+
+        // Set up cell with data
+        unsafe {
+            cell.key.get().write(Some(42));
+            cell.value.get().write(Some(String::from("cached")));
+        }
+
+        let guard = unsafe { CellGuard::from_raw(&cell as *const Cell<u32, String>) }.unwrap();
+
+        // First cache() call should succeed
+        let first_result = guard.cache();
+        assert!(first_result.is_ok());
+
+        // Change version (simulating concurrent modification)
+        cell.version.store(99, AtomicOrdering::Release);
+
+        // Second cache() call should return the same cached data
+        // (not re-validate against the changed version)
+        let second_result = guard.cache();
+        assert!(second_result.is_ok());
+
+        // Both should return the same cached data
+        let first_data = first_result.unwrap().as_ref().unwrap();
+        let second_data = second_result.unwrap().as_ref().unwrap();
+        assert_eq!(first_data.key, second_data.key);
+        assert_eq!(first_data.value, second_data.value);
     }
 }

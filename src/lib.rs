@@ -104,8 +104,6 @@ pub use cache_oblivious::BTreeMap;
 #[cfg(test)]
 mod tests {
     use crate::BTreeMap;
-    use std::thread;
-    use std::time;
 
     #[test]
     fn find_missing() {

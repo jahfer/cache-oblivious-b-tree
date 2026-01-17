@@ -412,7 +412,8 @@ where
                     //
                     // We can safely overwrite in both cases. However, if another operation is in
                     // progress (Inserting/Deleting marker), we should retry to avoid conflicts.
-                    let dest_marker_state = cell.load_marker_state(Ordering::SeqCst);
+                    // Acquire ordering synchronizes with writers' Release stores.
+                    let dest_marker_state = cell.load_marker_state(Ordering::Acquire);
                     match dest_marker_state {
                         MarkerState::Move | MarkerState::Empty => {
                             // Safe to overwrite:
@@ -439,8 +440,10 @@ where
                     continue;
                 }
 
-                let version = cell_to_move.version.load(Ordering::SeqCst);
-                let current_marker_state = cell_to_move.load_marker_state(Ordering::SeqCst);
+                // Acquire ordering synchronizes with writers' Release stores, ensuring
+                // we see any completed modifications to this cell.
+                let version = cell_to_move.version.load(Ordering::Acquire);
+                let current_marker_state = cell_to_move.load_marker_state(Ordering::Acquire);
 
                 // Only allow moving cells that are in Empty state
                 if current_marker_state != MarkerState::Empty {
@@ -2745,7 +2748,7 @@ mod tests {
         // but we can verify the system remains consistent
         let mut active_cells = 0;
         for cell in tree.data.as_slice().iter() {
-            let version = cell.version.load(Ordering::SeqCst);
+            let version = cell.version.load(Ordering::Acquire);
             if version > 0 {
                 active_cells += 1;
             }
